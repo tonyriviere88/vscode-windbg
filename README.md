@@ -286,6 +286,10 @@ npm run test:e2e             # runs the extension in VS Code (set VSCODE_EXECUTA
 **Run Extension** (F5) starts an Extension Development Host on `test/sample`, which has a ready
 `launch.json`.
 
+To release, bump `version` in `package.json` and push a matching tag (`git tag v0.2.0 && git push
+origin v0.2.0`). The Release workflow runs the unit tests, packages the extension and publishes a
+GitHub release with the `.vsix` attached. `npm run package` builds the same `.vsix` locally.
+
 Layout:
 
 | Path | Content |
