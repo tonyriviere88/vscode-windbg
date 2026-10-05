@@ -13,7 +13,7 @@ import {
     parseLogMessage,
     stripPrompts,
 } from '../../src/adapter/parsers';
-import { buildSourcePath, buildSymbolPath } from '../../src/adapter/symbols';
+import { buildSourcePath, buildSymbolPath, localSymbolPath } from '../../src/adapter/symbols';
 
 describe('cdb output parsers', () => {
     it('strips prompts', () => {
@@ -105,6 +105,13 @@ describe('symbol paths', () => {
     it('can omit the Microsoft server and inherit _NT_SYMBOL_PATH', () => {
         const p = buildSymbolPath({ cachePath: 'C:\\sym', useMicrosoftSymbolServer: false }, undefined, { _NT_SYMBOL_PATH: 'srv*E:\\x*https://a' });
         assert.strictEqual(p, 'cache*C:\\sym;srv*E:\\x*https://a');
+    });
+
+    it('keeps only local locations for the symbol path used at stops', () => {
+        const full = 'D:\\out;\\\\share\\pdbs;srv*C:\\sym*https://symbols.example.com;srv*C:\\sym*https://msdl.microsoft.com/download/symbols;srv*E:\\x*\\\\server\\store;srv*https://a;cache*C:\\c;symsrv*symsrv.dll*F:\\s*https://b';
+        assert.strictEqual(localSymbolPath(full), 'D:\\out;srv*C:\\sym;srv*E:\\x;cache*C:\\c;srv*F:\\s');
+        assert.strictEqual(localSymbolPath('D:\\out'), 'D:\\out');
+        assert.strictEqual(localSymbolPath('srv*https://a'), '');
     });
 
     it('builds source paths', () => {

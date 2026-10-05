@@ -106,6 +106,11 @@ int main(int argc, char** argv) {
         b.join();
         return 0;
     }
+    if (argc > 1 && std::string(argv[1]) == "late") {
+        HMODULE late = LoadLibraryW(L"late.dll");
+        auto lateValue = late ? reinterpret_cast<int (*)(int)>(GetProcAddress(late, "lateValue")) : nullptr;
+        return lateValue ? lateValue(20) : -1;
+    }
     if (argc > 1 && std::string(argv[1]) == "debugbreak") {
         __debugbreak();
         return 0;

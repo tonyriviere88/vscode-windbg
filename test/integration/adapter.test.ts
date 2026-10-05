@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { after, before, describe, it } from 'node:test';
 import { DebugClient } from '@vscode/debugadapter-testsupport';
@@ -10,6 +11,8 @@ const ROOT = path.resolve(__dirname, '..', '..', '..');
 const ADAPTER = path.join(ROOT, 'out', 'src', 'adapter', 'main.js');
 const SAMPLE_DIR = path.join(ROOT, 'test', 'sample');
 const SOURCE = path.join(SAMPLE_DIR, 'sample.cpp');
+const LATE_SOURCE = path.join(SAMPLE_DIR, 'late.cpp');
+const PLUGIN_SOURCE = path.join(SAMPLE_DIR, 'plugin.cpp');
 const PROGRAM = path.join(SAMPLE_DIR, 'out', 'sample.exe');
 const TIMEOUT = 20000;
 
@@ -21,7 +24,7 @@ function lineOf(text: string): number {
 }
 
 function ensureSample(): void {
-    const inputs = [SOURCE, path.join(SAMPLE_DIR, 'plugin.cpp'), path.join(SAMPLE_DIR, 'build.cmd')];
+    const inputs = [SOURCE, path.join(SAMPLE_DIR, 'plugin.cpp'), path.join(SAMPLE_DIR, 'late.cpp'), path.join(SAMPLE_DIR, 'build.cmd')];
     if (!fs.existsSync(PROGRAM) || inputs.some((f) => fs.statSync(PROGRAM).mtimeMs < fs.statSync(f).mtimeMs)) {
         execFileSync('cmd.exe', ['/c', path.join(SAMPLE_DIR, 'build.cmd')], { stdio: 'inherit' });
     }
@@ -359,7 +362,8 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
             const s = new Session();
             try {
                 const stopped = s.waitStopped();
-                await s.start({}, async () => {
+                // plugin.dll must stay deferred: its PDB is next to it.
+                await s.start({ symbols: { ...baseLaunch.symbols, autoLoadExclude: ['plug*'] } }, async () => {
                     await s.setLines([lineOf('// Counter::bump'), lineOf('// plugin object')]);
                 });
                 const tid = (await stopped).body.threadId!;
@@ -529,6 +533,179 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 assert.strictEqual(find(vars, 'total').value, '2');
             } finally {
                 await s.stop();
+            }
+        });
+    });
+
+    describe('symbol loading and breakpoints', () => {
+        const fileLine = (file: string, text: string) => fs.readFileSync(file, 'utf8').split(/\r?\n/).findIndex((l) => l.includes(text)) + 1;
+
+        it('binds a breakpoint in a DLL loaded later through its local PDB', async () => {
+            const s = new Session();
+            const changed: DebugProtocol.Breakpoint[] = [];
+            s.dc.on('breakpoint', (e: DebugProtocol.BreakpointEvent) => changed.push(e.body.breakpoint));
+            try {
+                const line = fileLine(LATE_SOURCE, '// late value');
+                let set: DebugProtocol.Breakpoint[] = [];
+                const stopped = s.waitStopped();
+                await s.start({ args: ['late'] }, async () => {
+                    set = (await s.dc.setBreakpointsRequest({ source: { path: LATE_SOURCE }, breakpoints: [{ line }] })).body.breakpoints;
+                });
+                assert.strictEqual(set[0].verified, false);
+                assert.match(set[0].message ?? '', /No loaded symbols contain this file/);
+                const ev = await stopped;
+                assert.strictEqual(ev.body.reason, 'breakpoint');
+                const top = await s.top(ev.body.threadId!);
+                assert.strictEqual(top.line, line);
+                assert.strictEqual(path.basename(top.source?.path ?? ''), 'late.cpp');
+                assert.ok(
+                    changed.some((b) => b.id === set[0].id && b.verified),
+                    'no breakpoint event reported the binding',
+                );
+            } finally {
+                await s.stop();
+            }
+        });
+
+        it('never loads symbols to set a breakpoint, and binds it when the module symbols are loaded', async () => {
+            const s = new Session();
+            const changed: DebugProtocol.Breakpoint[] = [];
+            s.dc.on('breakpoint', (e: DebugProtocol.BreakpointEvent) => changed.push(e.body.breakpoint));
+            try {
+                let set: DebugProtocol.Breakpoint[] = [];
+                const stopped = s.waitStopped();
+                await s.start({ args: ['late'], stopOnEntry: true, symbols: { ...baseLaunch.symbols, autoLoadLocal: false } }, async () => {
+                    set = (await s.dc.setBreakpointsRequest({ source: { path: PLUGIN_SOURCE }, breakpoints: [{ line: fileLine(PLUGIN_SOURCE, 'return new app::PluginShape') }] })).body.breakpoints;
+                });
+                assert.strictEqual((await stopped).body.reason, 'entry');
+                assert.strictEqual(set[0].verified, false);
+                const plugin = async () => {
+                    const res = await s.dc.customRequest('modules', {});
+                    return (res.body.modules as Array<{ shortName: string; symbolKind: string }>).find((m) => m.shortName.toLowerCase() === 'plugin')!;
+                };
+                assert.strictEqual((await plugin()).symbolKind, 'deferred', 'setting the breakpoint loaded the plugin symbols');
+                await s.dc.customRequest('loadSymbols', { module: 'plugin' });
+                assert.strictEqual((await plugin()).symbolKind, 'pdb');
+                assert.ok(
+                    changed.some((b) => b.id === set[0].id && b.verified),
+                    'loading the plugin symbols did not bind the breakpoint',
+                );
+            } finally {
+                await s.stop();
+            }
+        });
+
+        it('binds function breakpoints, bare or qualified, when their DLL loads', async () => {
+            for (const name of ['lateValue', 'late!lateValue']) {
+                const s = new Session();
+                try {
+                    let set: DebugProtocol.Breakpoint[] = [];
+                    const stopped = s.waitStopped();
+                    await s.start({ args: ['late'] }, async () => {
+                        set = (await s.dc.setFunctionBreakpointsRequest({ breakpoints: [{ name }] })).body.breakpoints;
+                    });
+                    assert.strictEqual(set[0].verified, false, name);
+                    assert.match(set[0].message ?? '', /No loaded symbols contain this function/);
+                    const ev = await stopped;
+                    assert.strictEqual(ev.body.reason, 'function breakpoint', name);
+                    assert.strictEqual(path.basename((await s.top(ev.body.threadId!)).source?.path ?? ''), 'late.cpp', name);
+                } finally {
+                    await s.stop();
+                }
+            }
+        });
+
+        it('loads the modules of "alwaysLoad", from the setting and from Always Load Symbols', async () => {
+            const s = new Session();
+            try {
+                const line = fileLine(LATE_SOURCE, '// late value');
+                let set: DebugProtocol.Breakpoint[] = [];
+                const entry = s.waitStopped();
+                await s.start({ args: ['late'], stopOnEntry: true, symbols: { ...baseLaunch.symbols, autoLoadLocal: false, alwaysLoad: ['plug*'] } }, async () => {
+                    set = (await s.dc.setBreakpointsRequest({ source: { path: LATE_SOURCE }, breakpoints: [{ line }] })).body.breakpoints;
+                });
+                await entry;
+                const kinds = async () => {
+                    const res = await s.dc.customRequest('modules', {});
+                    return new Map((res.body.modules as Array<{ shortName: string; symbolKind: string }>).map((m) => [m.shortName.toLowerCase(), m.symbolKind]));
+                };
+                let k = await kinds();
+                assert.strictEqual(k.get('plugin'), 'pdb', 'alwaysLoad did not load plugin');
+                assert.strictEqual(k.get('msvcp140d'), 'deferred', 'a module outside alwaysLoad was loaded');
+                assert.strictEqual(set[0].verified, false);
+                // late.dll is not loaded yet: from now on it loads with its symbols, and the
+                // breakpoint binds then.
+                await s.dc.customRequest('alwaysLoadSymbols', { module: 'late' });
+                const hit = await s.run(() => s.dc.continueRequest({ threadId: 0 }));
+                assert.strictEqual(hit.body.reason, 'breakpoint');
+                assert.strictEqual((await s.top(hit.body.threadId!)).line, line);
+                k = await kinds();
+                assert.strictEqual(k.get('late'), 'pdb');
+            } finally {
+                await s.stop();
+            }
+        });
+
+        it('walks every stack like dbgeng does, without loading symbols', async () => {
+            const s = new Session();
+            try {
+                await s.start({ args: ['wait'], showExternalCode: true, justMyCode: false }, async () => {});
+                // Let main reach its Sleep loop: the threads are then in ntdll and KERNELBASE.
+                await new Promise((r) => setTimeout(r, 1500));
+                await s.run(() => s.dc.pauseRequest({ threadId: 0 }));
+                const kinds = async () => {
+                    const res = await s.dc.customRequest('modules', {});
+                    return (res.body.modules as Array<{ shortName: string; symbolKind: string }>).map((m) => `${m.shortName}:${m.symbolKind}`).sort();
+                };
+                const before = await kinds();
+                const ours = new Map<number, string[]>();
+                for (const t of (await s.dc.threadsRequest()).body.threads) {
+                    const st = await s.dc.stackTraceRequest({ threadId: t.id, levels: 100 });
+                    ours.set(t.id, st.body.stackFrames.map((f) => BigInt(f.instructionPointerReference ?? '0').toString(16)));
+                }
+                assert.deepStrictEqual(await kinds(), before, 'walking the stacks loaded symbols');
+                // dbgeng's own walk, which loads what it wants: each row's RetAddr is the next frame.
+                const k = (await s.dc.evaluateRequest({ expression: '~*k 100', context: 'repl' })).body.result;
+                let compared = 0;
+                for (const block of k.split(/\n(?=\s*[.#]?\s*\d+\s+Id: )/)) {
+                    const id = /Id: [0-9a-f]+\.([0-9a-f]+)/i.exec(block);
+                    if (!id) {
+                        continue;
+                    }
+                    const theirs = [...block.matchAll(/^([0-9a-f]{8}`[0-9a-f]{8}) ([0-9a-f]{8}`[0-9a-f]{8}) /gim)].map((m) => BigInt('0x' + m[2].replace('`', '')).toString(16));
+                    const mine = ours.get(parseInt(id[1], 16));
+                    assert.ok(mine, `thread ${id[1]} missing`);
+                    // RetAddr of the last row is 0: the end of the stack.
+                    assert.deepStrictEqual(mine.slice(1), theirs.filter((a) => a !== '0'), `stack of thread ${id[1]}`);
+                    compared++;
+                }
+                assert.ok(compared >= 1);
+            } finally {
+                await s.stop();
+            }
+        });
+
+        it('does not load a local PDB that does not match its DLL', async () => {
+            // A copy of the sample whose plugin.pdb belongs to another DLL. plugin.dll still names
+            // the real one, which dbgeng would find if the adapter let it search.
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'windbg-stale-'));
+            const out = path.dirname(PROGRAM);
+            for (const f of ['sample.exe', 'sample.pdb', 'plugin.dll', 'late.dll']) {
+                fs.copyFileSync(path.join(out, f), path.join(dir, f));
+            }
+            fs.copyFileSync(path.join(out, 'late.pdb'), path.join(dir, 'plugin.pdb'));
+            const s = new Session();
+            try {
+                const stopped = s.waitStopped();
+                await s.start({ program: path.join(dir, 'sample.exe'), stopOnEntry: true }, async () => {});
+                await stopped;
+                const res = await s.dc.customRequest('modules', {});
+                const kind = (n: string) => (res.body.modules as Array<{ shortName: string; symbolKind: string }>).find((m) => m.shortName.toLowerCase() === n)!.symbolKind;
+                assert.strictEqual(kind('sample'), 'pdb');
+                assert.strictEqual(kind('plugin'), 'deferred', 'the stale plugin.pdb made the adapter load symbols');
+            } finally {
+                await s.stop();
+                fs.rmSync(dir, { recursive: true, force: true });
             }
         });
     });

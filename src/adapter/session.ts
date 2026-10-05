@@ -32,6 +32,7 @@ import {
     codeId,
     exceptionName,
 } from './exceptions';
+import { wildcardToRegExp } from './glob';
 import { JustMyCode, moduleBaseName } from './jmc';
 import { locateBreakin, locateCdb } from './locator';
 import {
@@ -48,7 +49,7 @@ import {
     parseLogMessage,
 } from './parsers';
 import { ModuleDetails, RawModule, WinDbgModule, parseModuleList, toModule } from './modules';
-import { buildSourcePath, buildSymbolPath } from './symbols';
+import { buildSourcePath, buildSymbolPath, localSymbolPath } from './symbols';
 import { AttachArguments, BridgeVar, ExceptionOverride, FrameInfo, LaunchArguments, NoLoadResult, ThreadInfo } from './types';
 
 const SCRIPT_PATH = path.join(__dirname, '..', '..', '..', 'dbgscript', 'vscode_windbg.js');
@@ -84,6 +85,31 @@ interface BpRecord {
     accessType?: string;
     instructionReference?: string;
     offset?: number;
+    /** Source breakpoint not set in cdb yet: no loaded PDB contains its file (the script retries). */
+    unbound?: boolean;
+}
+
+/** A pending breakpoint the script set in cdb: the `bu` output and its `bl` row. */
+interface PendingBinding {
+    id: number;
+    module: string;
+    output: string;
+    listing: string;
+}
+
+/** Printed by the script when a module load bound a pending breakpoint, then its JSON. */
+const MARK_BOUND = '@@WDBGBOUND@@';
+
+/** Where the script puts a module name in the command of a pending breakpoint. */
+const MODULE_SLOT = '@@MODULE@@';
+
+/** Shown on a source or function breakpoint that no loaded PDB contains. */
+const UNBOUND_FILE_MESSAGE = 'No loaded symbols contain this file yet. The breakpoint binds when the symbols of its module load.';
+const UNBOUND_FUNCTION_MESSAGE = 'No loaded symbols contain this function yet. The breakpoint binds when the symbols of its module load.';
+
+/** Module name settings (names without extension, * wildcards) as regular expression sources. */
+function modulePatterns(list: string[] | undefined): string[] {
+    return (list ?? []).filter((s) => s.trim()).map((s) => wildcardToRegExp(moduleBaseName(s.trim()), true).source);
 }
 
 type StepKind = 'over' | 'in' | 'out';
@@ -175,7 +201,6 @@ export class WinDbgSession extends DebugSession {
     private isAttach = false;
     private isDump = false;
     private targetPid: number | undefined;
-    private mainModule: string | undefined;
     private breakinPath: string | undefined;
     private jmc = new JustMyCode(false, undefined, undefined, {});
     private exceptions = new ExceptionPolicy();
@@ -185,6 +210,10 @@ export class WinDbgSession extends DebugSession {
     private evaluationTimeoutMs = 10000;
     /** The launched target uses cdb's console, so it receives the Ctrl+Break of an interrupt too. */
     private consoleShared = false;
+    /** The script loads symbols when a module loads ("symbols.autoLoadLocal", "symbols.alwaysLoad"). */
+    private loadAtModuleLoad = false;
+    /** The symbol path with the symbol servers, used by explicit loads only. */
+    private fullSymbolPath = '';
 
     private bpById = new Map<number, BpRecord>();
     private sourceBps = new Map<string, BpRecord[]>();
@@ -195,7 +224,7 @@ export class WinDbgSession extends DebugSession {
     private nextCdbId = FIRST_BREAKPOINT_ID;
     private nextDapId = 1;
 
-    private frames = new Map<number, { tid: number; index: number }>();
+    private frames = new Map<number, { tid: number; index: number; module?: string }>();
     private nextFrameId = 1;
     private threadsCache: DebugProtocol.Thread[] = [];
     /** Thread id -> cdb thread index, for the "0:003>" prompt. */
@@ -459,8 +488,11 @@ export class WinDbgSession extends DebugSession {
         }
 
         const symbolPath = args.symbolPath?.trim() || buildSymbolPath(args.symbols ?? {}, programDir);
+        // Stops use no symbol server: a stack walk loads the symbols of every module on the stack.
+        const localPath = localSymbolPath(symbolPath);
+        this.fullSymbolPath = symbolPath;
         const sourcePath = buildSourcePath(args.sourcePaths, args.sourceServer);
-        const setup = ['.lines -e', 'l+t', 'l-s', 'n 10', `.sympath ${symbolPath}`];
+        const setup = ['.lines -e', 'l+t', 'l-s', 'n 10', `.sympath ${localPath || 'cache*'}`];
         if (sourcePath) {
             setup.push(`.srcpath ${sourcePath}`);
         }
@@ -470,7 +502,10 @@ export class WinDbgSession extends DebugSession {
         for (const c of setup) {
             await cdb.exec(c);
         }
-        this.log(`Symbol path: ${symbolPath}`);
+        this.log(`Symbol path: ${localPath}`);
+        if (localPath !== symbolPath) {
+            this.log(`Symbol servers, used by Load Symbols and "windbg.symbols.alwaysLoad" only: ${symbolPath}`);
+        }
         this.log(
             args.consoleMode === 'expressions'
                 ? 'Debug Console: C++ expressions. Prefix WinDbg commands with -exec, e.g. "-exec lm".'
@@ -487,7 +522,25 @@ export class WinDbgSession extends DebugSession {
                 this.log(`Loaded natvis: ${file}`);
             }
         }
+        const sym = args.symbols ?? {};
+        const always = modulePatterns(sym.alwaysLoad);
+        this.loadAtModuleLoad = sym.autoLoadLocal !== false || always.length > 0;
+        await this.call('configureSymbols', {
+            localPath,
+            fullPath: symbolPath,
+            local: sym.autoLoadLocal !== false,
+            include: modulePatterns(sym.autoLoadInclude),
+            exclude: modulePatterns(sym.autoLoadExclude),
+            always,
+            program: this.isAttach || this.isDump ? undefined : args.program,
+        });
         await this.applyExceptionPolicy();
+        if (this.loadAtModuleLoad) {
+            const loaded = await this.call<string[]>('autoLoadExisting');
+            if (loaded.length > 0) {
+                this.trace(`[symbols] loaded local PDBs: ${loaded.join(', ')}\n`);
+            }
+        }
         for (const c of args.initCommands ?? []) {
             const out = await cdb.exec(c);
             if (out.trim()) {
@@ -503,7 +556,6 @@ export class WinDbgSession extends DebugSession {
         }
         const proc = await this.call<{ pid: number; main?: string }>('process');
         this.targetPid = proc.pid;
-        this.mainModule = proc.main ? moduleBaseName(proc.main) : undefined;
         // VS Code pauses the focused or first known thread: it must know threads before the first stop.
         await this.refreshThreads();
         this.state = 'stopped';
@@ -535,7 +587,19 @@ export class WinDbgSession extends DebugSession {
     // ------------------------------------------------------- execution
 
     private onRunOutput(line: string): void {
-        const mod = /^ModLoad: [0-9a-f`]+ [0-9a-f`]+\s+(.*)$/i.exec(line);
+        const bound = line.indexOf(MARK_BOUND);
+        if (bound >= 0) {
+            try {
+                const rec = this.applyBound(JSON.parse(line.slice(bound + MARK_BOUND.length)) as PendingBinding);
+                if (rec) {
+                    this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(rec)));
+                }
+            } catch (e) {
+                this.trace(`[bp] bad binding report: ${errorText(e)}\n`);
+            }
+            return;
+        }
+        const mod =/^ModLoad: [0-9a-f`]+ [0-9a-f`]+\s+(.*)$/i.exec(line);
         if (mod) {
             this.log(`Loaded '${mod[1].trim()}'`);
             return;
@@ -608,6 +672,9 @@ export class WinDbgSession extends DebugSession {
                 if (currentStep?.instruction) {
                     await this.exec('l-t');
                 }
+                await this.runInternalJobs();
+                // A selected frame's registers are only the debugger's view: steps start from the thread's own.
+                await this.call('resetContext');
                 await this.runInternalJobs();
                 // No await between the last queue check and the command: later jobs need a break-in.
                 this.analyzing = false;
@@ -741,14 +808,24 @@ export class WinDbgSession extends DebugSession {
         if (le.kind === 'exit') {
             return { kind: 'exit', code: le.exitCode };
         }
-        const where = await this.where(step ? MAX_JMC_STEPS : 16);
-        this.lastWhere = where;
-        const tid = where.tid;
+        // The stack is only walked when the stop needs it: walking it loads the symbols of every
+        // module on it, and a stop nobody sees (a hit count not reached, an exception that does
+        // not break...) must cost nothing.
+        this.lastWhere = undefined;
+        let walked: Where | undefined;
+        const where = async () => {
+            if (!walked) {
+                walked = await this.where(step ? MAX_JMC_STEPS : 16);
+                this.lastWhere = walked;
+            }
+            return walked;
+        };
+        const tid = async () => (await where()).tid;
 
-        if (le.kind === 'exception' && (le.code === BREAKPOINT_CODE || le.code === WOW64_BREAKPOINT_CODE) && this.isBreakinStop(where)) {
+        if (le.kind === 'exception' && (le.code === BREAKPOINT_CODE || le.code === WOW64_BREAKPOINT_CODE) && this.isBreakinStop(await where())) {
             if (this.pauseRequested) {
                 this.pauseRequested = false;
-                const target = await this.pauseThread(tid);
+                const target = await this.pauseThread(await tid());
                 return { kind: 'report', reason: 'pause', tid: target };
             }
             return { kind: 'continue', command: 'g' };
@@ -757,7 +834,7 @@ export class WinDbgSession extends DebugSession {
         if (le.kind === 'breakpoint') {
             if (this.entryBps.includes(le.id)) {
                 await this.clearEntryBreakpoints();
-                return { kind: 'report', reason: 'entry', tid };
+                return { kind: 'report', reason: 'entry', tid: await tid() };
             }
             const bp = this.bpById.get(le.id);
             if (!bp) {
@@ -767,20 +844,20 @@ export class WinDbgSession extends DebugSession {
                 }
                 if (step) {
                     // Internal breakpoint used by `gu`.
-                    return this.continueStep(step, where);
+                    return this.continueStep(step, await where());
                 }
-                return { kind: 'report', reason: 'breakpoint', tid, description: `Breakpoint ${le.id}` };
+                return { kind: 'report', reason: 'breakpoint', tid: await tid(), description: `Breakpoint ${le.id}` };
             }
             bp.hits++;
             if (bp.hit && !hitConditionSatisfied(bp.hit, bp.hits)) {
                 return this.resumeAfterIgnoredStop(step);
             }
             if (bp.logMessage) {
-                await this.emitLogpoint(bp, where);
+                await this.emitLogpoint(bp, le.tid, where);
                 return this.resumeAfterIgnoredStop(step);
             }
             const reason = bp.kind === 'data' ? 'data breakpoint' : bp.kind === 'function' ? 'function breakpoint' : bp.kind === 'instruction' ? 'instruction breakpoint' : 'breakpoint';
-            return { kind: 'report', reason, tid, hitIds: [bp.dapId], hitCdbId: bp.cdbId };
+            return { kind: 'report', reason, tid: await tid(), hitIds: [bp.dapId], hitCdbId: bp.cdbId };
         }
 
         if (le.kind === 'exception') {
@@ -798,13 +875,13 @@ export class WinDbgSession extends DebugSession {
                 }
             }
             this.lastException = info;
-            return { kind: 'report', reason: 'exception', tid, text: info.description };
+            return { kind: 'report', reason: 'exception', tid: await tid(), text: info.description };
         }
 
         if (step) {
-            return this.continueStep(step, where);
+            return this.continueStep(step, await where());
         }
-        return { kind: 'report', reason: 'pause', tid };
+        return { kind: 'report', reason: 'pause', tid: await tid() };
     }
 
     /**
@@ -919,9 +996,12 @@ export class WinDbgSession extends DebugSession {
         return state;
     }
 
-    private async emitLogpoint(bp: BpRecord, where: Where): Promise<void> {
+    /** Prints a logpoint's message. The stack is walked only for the keywords that need it. */
+    private async emitLogpoint(bp: BpRecord, eventTid: number | undefined, walk: () => Promise<Where>): Promise<void> {
         const parts = parseLogMessage(bp.logMessage ?? '');
         const exprs = parts.filter((p): p is { expr: string } => 'expr' in p).map((p) => p.expr);
+        const needsStack = parts.some((p) => !('expr' in p) && /\$(FUNCTION|CALLER|CALLSTACK|ADDRESS|FILEPOS)\b/.test(p.text));
+        const where: Where = needsStack || eventTid === undefined ? await walk() : { tid: eventTid, frames: [] };
         let values: Array<{ ok: boolean; value: string }> = [];
         if (exprs.length > 0) {
             try {
@@ -953,7 +1033,11 @@ export class WinDbgSession extends DebugSession {
             })
             .join('');
         const out = new OutputEvent(text + '\n', 'console') as DebugProtocol.OutputEvent;
-        if (top?.file) {
+        if (!top && bp.file) {
+            // Without a stack walk, the logpoint's own line.
+            out.body.source = new Source(path.basename(bp.file), bp.file);
+            out.body.line = bp.actualLine ?? bp.line;
+        } else if (top?.file) {
             out.body.source = new Source(path.basename(top.file), this.toLocalPath(top.file));
             out.body.line = top.line;
         }
@@ -1240,7 +1324,11 @@ export class WinDbgSession extends DebugSession {
     }
 
     private async createInCdb(rec: BpRecord, command: string): Promise<void> {
-        const out = await this.exec(command);
+        this.noteProblem(rec, await this.exec(command));
+    }
+
+    /** Keeps the error a breakpoint command printed as the breakpoint's message. */
+    private noteProblem(rec: BpRecord, out: string): void {
         const problem = out
             .split('\n')
             .filter((l) => !SYMOPT_LISTING.test(l))
@@ -1250,6 +1338,29 @@ export class WinDbgSession extends DebugSession {
         }
     }
 
+    /** Records a breakpoint the script set in cdb; returns it unless it was removed meanwhile. */
+    private applyBound(b: PendingBinding): BpRecord | undefined {
+        const rec = this.bpById.get(b.id);
+        if (!rec?.unbound) {
+            return undefined;
+        }
+        rec.unbound = false;
+        if (rec.message === UNBOUND_FILE_MESSAGE || rec.message === UNBOUND_FUNCTION_MESSAGE) {
+            rec.message = undefined;
+        }
+        this.noteProblem(rec, b.output);
+        const e = parseBreakpointList(b.listing).get(b.id);
+        rec.verified = !!e && !e.unresolved && !rec.message?.startsWith('Invalid hit count');
+        if (rec.verified && !rec.message?.startsWith('Invalid')) {
+            rec.message = undefined;
+        }
+        if (rec.kind === 'source' && e?.line) {
+            rec.actualLine = e.line;
+        }
+        this.trace(`[bp] ${b.id} bound in ${b.module}\n`);
+        return rec;
+    }
+
     private async deleteFromCdb(recs: BpRecord[]): Promise<void> {
         if (recs.length === 0) {
             return;
@@ -1257,10 +1368,18 @@ export class WinDbgSession extends DebugSession {
         for (const r of recs) {
             this.bpById.delete(r.cdbId);
         }
-        await this.exec(`bc ${recs.map((r) => r.cdbId).join(' ')}`);
+        const unbound = recs.filter((r) => r.unbound).map((r) => r.cdbId);
+        if (unbound.length > 0) {
+            await this.call('dropBreakpoints', { ids: unbound });
+        }
+        const bound = recs.filter((r) => !r.unbound).map((r) => r.cdbId);
+        if (bound.length > 0) {
+            await this.exec(`bc ${bound.join(' ')}`);
+        }
     }
 
-    private async verify(recs: BpRecord[]): Promise<void> {
+    private async verify(all: BpRecord[]): Promise<void> {
+        const recs = all.filter((r) => !r.unbound);
         if (recs.length === 0) {
             return;
         }
@@ -1292,7 +1411,9 @@ export class WinDbgSession extends DebugSession {
             return;
         }
         try {
-            await this.verify(pending);
+            // Symbols loaded since (a stack walk, a console command...) may contain their file.
+            await this.bindPendingBreakpoints();
+            await this.verify(pending.filter((r) => !r.verified));
             for (const r of pending) {
                 if (r.verified) {
                     this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(r)));
@@ -1301,6 +1422,52 @@ export class WinDbgSession extends DebugSession {
         } catch {
             // best effort
         }
+    }
+
+    /**
+     * Sets new source or function breakpoints in the modules whose PDB is loaded, never loading one:
+     * unqualified, dbgeng would load the PDB of every module to find the file or the function. The
+     * others stay pending in the script, which tries them again as PDBs load.
+     */
+    private async bindInLoadedModules(bps: Array<{ rec: BpRecord; command: string; module?: string }>): Promise<void> {
+        if (bps.length === 0) {
+            return;
+        }
+        for (const b of bps) {
+            b.rec.unbound = true;
+        }
+        const req = bps.map((b) => ({ id: b.rec.cdbId, command: b.command, module: b.module }));
+        for (const b of await this.call<PendingBinding[]>('bindBreakpoints', { bps: req })) {
+            this.applyBound(b);
+        }
+        for (const { rec } of bps) {
+            if (rec.unbound) {
+                rec.verified = false;
+                rec.message ??= rec.kind === 'source' ? UNBOUND_FILE_MESSAGE : UNBOUND_FUNCTION_MESSAGE;
+            }
+        }
+    }
+
+    /** Frames shown as module+offset get their names once the module's symbols are loaded. */
+    private invalidateStacksAfterLoad(): void {
+        if (this.state === 'stopped') {
+            this.sendEvent(new InvalidatedEvent(['stacks']));
+        }
+    }
+
+    /** Sets the pending breakpoints in the modules whose PDB got loaded; cdb must hold the target. */
+    private async bindPendingBreakpoints(): Promise<BpRecord[]> {
+        if (![...this.bpById.values()].some((r) => r.unbound)) {
+            return [];
+        }
+        const bound: BpRecord[] = [];
+        for (const b of await this.call<PendingBinding[]>('retryBreakpoints')) {
+            const rec = this.applyBound(b);
+            if (rec) {
+                bound.push(rec);
+            }
+        }
+        return bound;
     }
 
     private async clearEntryBreakpoints(): Promise<void> {
@@ -1343,11 +1510,13 @@ export class WinDbgSession extends DebugSession {
                         continue;
                     }
                     const rec = this.newRecord('source', { file, line: req.line, condition: req.condition, hitCondition: req.hitCondition, logMessage: req.logMessage });
-                    await this.createInCdb(rec, `bu${rec.cdbId}${this.conditionClause(req.condition)} \`${this.toCompiledPath(file)}:${req.line}\``);
                     result.push(rec);
                     created.push(rec);
                 }
-                await this.verify(created);
+                const compiled = this.toCompiledPath(file);
+                await this.bindInLoadedModules(
+                    created.map((rec) => ({ rec, command: `bu${rec.cdbId}${this.conditionClause(rec.condition)} \`${MODULE_SLOT}!${compiled}:${rec.line}\`` })),
+                );
                 this.sourceBps.set(key, result);
                 return result;
             });
@@ -1363,27 +1532,17 @@ export class WinDbgSession extends DebugSession {
             const recs = await this.runWhenStopped(async () => {
                 await this.deleteFromCdb(this.functionBps);
                 const result: BpRecord[] = [];
+                const bps: Array<{ rec: BpRecord; command: string; module?: string }> = [];
                 for (const req of args.breakpoints) {
                     const rec = this.newRecord('function', { name: req.name, condition: req.condition, hitCondition: req.hitCondition });
+                    // "module!name" binds in that module only, a bare name in the first module that has it.
                     const name = req.name.trim();
-                    const bu = (expr: string) => `bu${rec.cdbId}${this.conditionClause(req.condition)} ${expr}`;
-                    if (name.includes('!') || !this.mainModule) {
-                        await this.createInCdb(rec, bu(name));
-                    } else {
-                        // Unqualified names do not load symbols: try the main module, then all modules.
-                        await this.createInCdb(rec, bu(`${this.mainModule}!${name}`));
-                        await this.verify([rec]);
-                        if (!rec.verified) {
-                            await this.exec(`bc ${rec.cdbId}`);
-                            rec.message = undefined;
-                            // One cdb command: no other request (a hover...) can run while unqualified
-                            // loads are on, and they cannot stay on if the command fails.
-                            await this.createInCdb(rec, `.symopt- 0x100\n${bu(name)}\n.symopt+ 0x100`);
-                        }
-                    }
+                    const bang = name.indexOf('!');
+                    const module = bang > 0 ? moduleBaseName(name.slice(0, bang)) : undefined;
+                    bps.push({ rec, command: `bu${rec.cdbId}${this.conditionClause(req.condition)} ${MODULE_SLOT}!${name.slice(bang + 1)}`, module });
                     result.push(rec);
                 }
-                await this.verify(result);
+                await this.bindInLoadedModules(bps);
                 this.functionBps = result;
                 return result;
             });
@@ -1476,6 +1635,10 @@ export class WinDbgSession extends DebugSession {
             await this.exec(`sxi 0x${CONTROL_BREAK_CODE.toString(16)}`);
             await this.exec(`sxe -h 0x${CONTROL_BREAK_CODE.toString(16)}`);
         }
+        if (this.loadAtModuleLoad && !this.isDump) {
+            // At every module load the script loads the local PDB and binds pending source breakpoints.
+            await this.exec('sxe -c "!vscwdbgld;gc" ld');
+        }
     }
 
     protected async setExceptionBreakPointsRequest(response: DebugProtocol.SetExceptionBreakpointsResponse, args: DebugProtocol.SetExceptionBreakpointsArguments): Promise<void> {
@@ -1538,9 +1701,9 @@ export class WinDbgSession extends DebugSession {
 
     private toDapFrame(f: FrameInfo, tid: number): DebugProtocol.StackFrame {
         const id = this.nextFrameId++;
-        this.frames.set(id, { tid, index: f.i });
         const parsed = parseFrameText(f.text ?? '');
         const module = parsed.module ?? (f.mod ? moduleBaseName(f.mod) : undefined);
+        this.frames.set(id, { tid, index: f.i, module });
         const fn = f.fn ?? parsed.fn;
         let name = fn ? (module ? `${module}!${fn}` : fn) : f.text ?? '<unknown>';
         if (!f.file && parsed.offset) {
@@ -2028,7 +2191,14 @@ export class WinDbgSession extends DebugSession {
                 case 'loadSymbols': {
                     // args.module: a module's short name, or undefined for all modules.
                     const target = typeof args?.module === 'string' && args.module ? args.module : '*';
-                    const out = await this.runWhenStopped(() => this.exec(`ld ${target}`));
+                    const out = await this.runWhenStopped(async () => {
+                        const text = await this.call<string>('explicitLoad', { command: `ld ${target}` });
+                        for (const rec of await this.bindPendingBreakpoints()) {
+                            this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(rec)));
+                        }
+                        this.invalidateStacksAfterLoad();
+                        return text;
+                    });
                     response.body = { output: out, modules: await this.runWhenStopped(() => this.listModules()) };
                     break;
                 }
@@ -2041,13 +2211,40 @@ export class WinDbgSession extends DebugSession {
                     const out = await this.runWhenStopped(async () => {
                         await this.exec('!sym noisy');
                         try {
-                            return await this.exec(`.reload /f ${image.includes(' ') ? `"${image}"` : image}`);
+                            return await this.call<string>('explicitLoad', { command: `.reload /f ${image.includes(' ') ? `"${image}"` : image}` });
                         } finally {
                             await this.exec(this.args.symbols?.verbose ? '!sym noisy' : '!sym quiet');
                         }
                     });
-                    const sympath = await this.runWhenStopped(() => this.exec('.sympath'));
+                    const sympath = `Symbol search path is: ${this.fullSymbolPath}`;
                     response.body = { output: `${sympath}\n\n${out}`, modules: await this.runWhenStopped(() => this.listModules()) };
+                    break;
+                }
+                case 'frameModule': {
+                    // args.frameId: a stack frame; answers the name of its module.
+                    response.body = { module: this.frames.get(Number(args?.frameId))?.module };
+                    break;
+                }
+                case 'alwaysLoadSymbols': {
+                    // args.module: a module now in "windbg.symbols.alwaysLoad". Loads it, and every
+                    // module of that name loading from now on.
+                    const module = String(args?.module ?? '');
+                    if (!module) {
+                        throw new Error('No module given.');
+                    }
+                    await this.runWhenStopped(async () => {
+                        await this.call('addAlwaysLoad', { pattern: modulePatterns([module])[0] });
+                        if (!this.loadAtModuleLoad) {
+                            this.loadAtModuleLoad = true;
+                            await this.applyExceptionPolicy();
+                        }
+                        await this.call<string>('explicitLoad', { command: `ld ${moduleBaseName(module)}` });
+                        for (const rec of await this.bindPendingBreakpoints()) {
+                            this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(rec)));
+                        }
+                        this.invalidateStacksAfterLoad();
+                    });
+                    response.body = { modules: await this.runWhenStopped(() => this.listModules()) };
                     break;
                 }
                 case 'reloadSymbols': {

@@ -190,39 +190,359 @@ function findThread(tid) {
     throw new Error("Thread " + tid + " not found");
 }
 
-function frameAt(thread, index) {
-    let i = 0;
-    for (let f of thread.Stack.Frames) {
-        if (i === index) return f;
-        i++;
-    }
-    throw new Error("Frame " + index + " not found");
-}
+// Stacks are walked here, not by dbgeng: its walk loads the symbols of every module on the
+// stack, even to only read frame addresses, and a stop must not load any. x64 unwinding only
+// needs the unwind data of the images (.pdata, .xdata), read from memory. A frame is named from
+// the symbols already loaded; in a module without them it shows as module+offset. Inline frames,
+// which come from the PDBs, are not shown.
 
-function ensureContext(tid, frame) {
-    if (tid === undefined || tid === null) return;
-    let th = findThread(tid);
-    if (num(host.currentThread.Id) !== tid) th.SwitchTo();
-    frameAt(th, frame || 0).SwitchTo();
-}
+// Registers by their number in x64 unwind codes.
+const GPR = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+// Registers a callee preserves: what a frame's context carries over from its callee.
+const NONVOLATILE = ["rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"];
+const MAX_FRAMES = 1000;
 
-function frameInfo(f, i) {
-    let r = { i: i };
-    r.text = safe(() => String(f), "");
-    let a = safe(() => f.Attributes, undefined);
-    if (a) {
-        r.ip = safe(() => hexOf(a.InstructionOffset), undefined);
-        r.sp = safe(() => hexOf(a.StackOffset), undefined);
-        r.inl = safe(() => !!a.IsInlineFrame, false);
-        let si = safe(() => a.SourceInformation, undefined);
-        if (si) {
-            r.fn = safe(() => si.FunctionName === undefined ? undefined : String(si.FunctionName), undefined);
-            r.file = safe(() => si.SourceFile === undefined ? undefined : String(si.SourceFile), undefined);
-            r.line = safe(() => si.SourceLine === undefined ? undefined : num(si.SourceLine), undefined);
-            r.mod = safe(() => si.Module === undefined ? undefined : String(si.Module), undefined);
+// Per stop: the modules, the walked stacks (thread id -> { frames, complete }) and frame names.
+let walkModules;
+let walkedStacks = new Map();
+let frameNames = new Map();
+// "tid:frame" whose registers are dbgeng's view (ChangeRegisterContext), or null: the threads' own.
+let contextFrame = null;
+
+function walkModuleList() {
+    if (!walkModules) {
+        walkModules = [];
+        for (let m of host.currentProcess.Modules) {
+            let base = safe(() => num(m.BaseAddress), undefined);
+            if (base === undefined) continue;
+            walkModules.push({ obj: m, name: moduleBaseName(safe(() => String(m.Name), "")), base: base, end: base + safe(() => num(m.Size), 0), pdata: undefined });
         }
     }
+    return walkModules;
+}
+
+function imageAt(addr) {
+    for (let m of walkModuleList()) if (addr >= m.base && addr < m.end) return m;
+    return null;
+}
+
+function readU64(addr) {
+    return host.memory.readMemoryValues(addr, 1, 8)[0];
+}
+
+function u16(bytes, at) {
+    return bytes[at] | (bytes[at + 1] << 8);
+}
+
+function s8(b) {
+    return b > 127 ? b - 256 : b;
+}
+
+function s32(bytes, at) {
+    return u32(bytes, at) | 0;
+}
+
+// The exception directory (the RUNTIME_FUNCTION table) of a module: { rva, count }, or null.
+function pdataOf(m) {
+    if (m.pdata === undefined) {
+        m.pdata = safe(() => {
+            let opt = m.base + read32(m.base + 0x3c) + 24;
+            if (num(host.memory.readMemoryValues(opt, 1, 2)[0]) !== 0x20b) return null;
+            let dir = opt + 112 + 3 * 8;
+            let rva = read32(dir);
+            let size = read32(dir + 4);
+            return rva && size >= 12 ? { rva: rva, count: Math.floor(size / 12) } : null;
+        }, null);
+    }
+    return m.pdata;
+}
+
+function runtimeFunction(m, at) {
+    let e = host.memory.readMemoryValues(m.base + at, 3, 4);
+    return { begin: num(e[0]), end: num(e[1]), unwind: num(e[2]) };
+}
+
+// The RUNTIME_FUNCTION covering addr (RVAs), or null: a leaf function, which has none.
+function functionEntry(m, addr) {
+    let p = pdataOf(m);
+    if (!p) return null;
+    let rel = addr - m.base;
+    let lo = 0;
+    let hi = p.count - 1;
+    while (lo <= hi) {
+        let mid = (lo + hi) >> 1;
+        let e = runtimeFunction(m, p.rva + 12 * mid);
+        if (rel < e.begin) hi = mid - 1;
+        else if (rel >= e.end) lo = mid + 1;
+        // An odd unwind RVA points at the primary entry of the function.
+        else return (e.unwind & 1) ? runtimeFunction(m, e.unwind & ~1) : e;
+    }
+    return null;
+}
+
+function unwindInfo(m, rva) {
+    let h = targetBytes(m.base + rva, 4);
+    let count = h[2];
+    let info = {
+        version: h[0] & 7, flags: h[0] >> 3, prolog: h[1], count: count, frameReg: h[3] & 15, frameOffset: h[3] >> 4,
+        codes: count ? targetBytes(m.base + rva + 4, 2 * count) : [], chained: null
+    };
+    if (info.flags & 4) {
+        let c = targetBytes(m.base + rva + 4 + 2 * (count + (count & 1)), 12);
+        info.chained = { begin: u32(c, 0), end: u32(c, 4), unwind: u32(c, 8) };
+    }
+    return info;
+}
+
+function codeSlots(op, opInfo) {
+    switch (op) {
+        case 1: return opInfo === 0 ? 2 : 3;
+        case 4: case 6: case 8: return 2;
+        case 5: case 7: case 9: return 3;
+        default: return 1;
+    }
+}
+
+// True when the prolog had established the frame register `offset` bytes into the function.
+function framePointerSet(info, offset) {
+    for (let i = 0; i < info.count; i += codeSlots(info.codes[2 * i + 1] & 15, info.codes[2 * i + 1] >> 4)) {
+        if ((info.codes[2 * i + 1] & 15) === 3) return offset >= info.codes[2 * i];
+    }
+    return false;
+}
+
+// Undoes the prolog operations that ran `offset` bytes into the function (all of them for a
+// chained entry). ctx.rsp is the frame base. True after a machine frame, which restores rip too.
+function undoProlog(info, offset, ctx) {
+    let machine = false;
+    for (let i = 0; i < info.count;) {
+        let at = info.codes[2 * i];
+        let op = info.codes[2 * i + 1] & 15;
+        let opInfo = info.codes[2 * i + 1] >> 4;
+        let slot = k => u16(info.codes, 2 * (i + k));
+        // In version 2, op 6 describes an epilog: nothing to undo.
+        if (offset >= at && !(info.version === 2 && op === 6)) {
+            switch (op) {
+                case 0: ctx.regs[GPR[opInfo]] = readU64(ctx.rsp); ctx.rsp += 8; break;
+                case 1: ctx.rsp += opInfo === 0 ? slot(1) * 8 : slot(1) + slot(2) * 65536; break;
+                case 2: ctx.rsp += opInfo * 8 + 8; break;
+                case 4: ctx.regs[GPR[opInfo]] = readU64(ctx.rsp + slot(1) * 8); break;
+                case 5: ctx.regs[GPR[opInfo]] = readU64(ctx.rsp + slot(1) + slot(2) * 65536); break;
+                case 10: {
+                    let frame = ctx.rsp + (opInfo ? 8 : 0);
+                    ctx.rip = num(readU64(frame));
+                    ctx.rsp = num(readU64(frame + 24));
+                    machine = true;
+                    break;
+                }
+                // 3 (frame register): applied before, as the frame base. 6-9: XMM registers.
+            }
+        }
+        i += codeSlots(op, opInfo);
+    }
+    return machine;
+}
+
+// When rip is in an epilog, runs the rest of it like Windows does (the prolog's unwind codes no
+// longer describe the stack there). True when it was one; next is then the caller's context.
+function leaveEpilog(m, fe, info, ctx, next) {
+    let b = safe(() => targetBytes(ctx.rip, 64), null);
+    if (!b) return false;
+    let i = 0;
+    let rsp = ctx.rsp;
+    let regs = Object.assign({}, ctx.regs);
+    if (b[0] === 0x48 && b[1] === 0x83 && b[2] === 0xc4) {
+        rsp += b[3];
+        i = 4;
+    } else if (b[0] === 0x48 && b[1] === 0x81 && b[2] === 0xc4) {
+        rsp += s32(b, 3);
+        i = 7;
+    } else if ((b[0] & 0xfe) === 0x48 && b[1] === 0x8d && ((b[2] >> 3) & 7) === 4) {
+        // lea rsp, [frame register + displacement]
+        let rm = (b[2] & 7) + (b[0] & 1 ? 8 : 0);
+        let mod = b[2] >> 6;
+        if (!info.frameReg || rm !== info.frameReg || (mod !== 1 && mod !== 2)) return false;
+        rsp = num(regs[GPR[rm]]) + (mod === 1 ? s8(b[3]) : s32(b, 3));
+        i = mod === 1 ? 4 : 7;
+    }
+    for (;;) {
+        if (b[i] >= 0x58 && b[i] <= 0x5f) {
+            regs[GPR[b[i] - 0x58]] = readU64(rsp);
+            i += 1;
+        } else if (b[i] === 0x41 && b[i + 1] >= 0x58 && b[i + 1] <= 0x5f) {
+            regs[GPR[8 + b[i + 1] - 0x58]] = readU64(rsp);
+            i += 2;
+        } else {
+            break;
+        }
+        rsp += 8;
+        if (i > 48) return false;
+    }
+    let outside = target => target < m.base + fe.begin || target >= m.base + fe.end;
+    let c = b[i];
+    let end = c === 0xc3 || c === 0xc2 || (c === 0xf3 && b[i + 1] === 0xc3) ||
+        (c === 0xe9 && outside(ctx.rip + i + 5 + s32(b, i + 1))) ||
+        (c === 0xeb && outside(ctx.rip + i + 2 + s8(b[i + 1]))) ||
+        (c === 0xff && b[i + 1] === 0x25) ||
+        (c === 0x48 && b[i + 1] === 0xff && (b[i + 2] & 0x38) === 0x20);
+    if (!end) return false;
+    next.regs = regs;
+    next.rip = num(readU64(rsp));
+    next.rsp = rsp + 8;
+    return true;
+}
+
+// The context of the caller of the frame whose context is ctx.
+function callerContext(ctx) {
+    let next = { rip: 0, rsp: ctx.rsp, regs: Object.assign({}, ctx.regs) };
+    let m = imageAt(ctx.rip);
+    let fe = m ? functionEntry(m, ctx.rip) : null;
+    if (!fe) {
+        // A leaf function: no prolog, the return address is at rsp.
+        next.rip = num(readU64(ctx.rsp));
+        next.rsp = ctx.rsp + 8;
+        return next;
+    }
+    let info = unwindInfo(m, fe.unwind);
+    let offset = ctx.rip - (m.base + fe.begin);
+    if (offset >= info.prolog && leaveEpilog(m, fe, info, ctx, next)) return next;
+    let machine = false;
+    for (let depth = 0; info && depth < 32; depth++) {
+        let ran = depth === 0 ? offset : Infinity;
+        if (info.frameReg && framePointerSet(info, ran)) next.rsp = num(next.regs[GPR[info.frameReg]]) - 16 * info.frameOffset;
+        machine = undoProlog(info, ran, next) || machine;
+        info = info.chained ? unwindInfo(m, info.chained.unwind) : null;
+    }
+    if (!machine) {
+        next.rip = num(readU64(next.rsp));
+        next.rsp += 8;
+    }
+    return next;
+}
+
+// The frame contexts { rip, rsp, regs } of a thread, at least `depth` of them when it has them.
+function walkThread(th, depth) {
+    let tid = num(th.Id);
+    let w = walkedStacks.get(tid);
+    if (w && (w.complete || w.frames.length >= depth)) return w.frames;
+    // The thread's own registers, not a frame's view set by ensureContext.
+    if (contextFrame !== null && contextFrame.split(":")[0] === String(tid)) resetContext();
+    let regs = th.Registers.User;
+    let ctx = { rip: num(regs.rip), rsp: num(regs.rsp), regs: {} };
+    for (let n of NONVOLATILE) ctx.regs[n] = safe(() => regs[n], 0);
+    let frames = [];
+    let complete = false;
+    let limit = Math.max(depth, Math.min(MAX_FRAMES, 2 * depth));
+    while (frames.length < limit) {
+        frames.push(ctx);
+        let next = safe(() => callerContext(ctx), null);
+        if (!next || !next.rip || next.rsp <= ctx.rsp || !imageAt(next.rip)) {
+            complete = true;
+            break;
+        }
+        ctx = next;
+    }
+    walkedStacks.set(tid, { frames: frames, complete: complete || frames.length >= MAX_FRAMES });
+    return frames;
+}
+
+let disassembler;
+
+// Function, file and line at addr in a module whose symbols are loaded (nothing gets loaded).
+function sourceAt(addr) {
+    if (!disassembler) disassembler = host.namespace.Debugger.Utility.Code.CreateDisassembler();
+    let si = safe(() => {
+        for (let ins of disassembler.DisassembleInstructions(addr)) return ins.SourceInformation;
+    }, undefined);
+    let fn = si ? safe(() => si.FunctionName === undefined ? undefined : String(si.FunctionName), undefined) : undefined;
+    if (!fn) return undefined;
+    return {
+        // Public symbols come with the '@' that dbgeng's frames leave out ("@ILT+1650(...)").
+        fn: fn.replace(/^@/, ""),
+        at: safe(() => num(si.FunctionAddress), undefined),
+        file: safe(() => si.SourceFile === undefined ? undefined : String(si.SourceFile), undefined),
+        line: safe(() => si.SourceLine === undefined ? undefined : num(si.SourceLine), undefined)
+    };
+}
+
+function frameInfo(ctx, i) {
+    let key = ctx.rip + ":" + (i > 0);
+    let named = frameNames.get(key);
+    if (!named) {
+        named = { text: "0x" + hexOf(ctx.rip) };
+        let m = imageAt(ctx.rip);
+        if (m) {
+            named.mod = m.name;
+            named.text = m.name + "+0x" + (ctx.rip - m.base).toString(16);
+            if (safe(() => String(m.obj.SymbolType), "Deferred") !== "Deferred") {
+                // A return address names the call before it.
+                let s = (i > 0 ? sourceAt(ctx.rip - 1) : undefined) || sourceAt(ctx.rip);
+                if (s) {
+                    named.fn = s.fn;
+                    named.text = m.name + "!" + s.fn + (s.at !== undefined && ctx.rip > s.at ? "+0x" + (ctx.rip - s.at).toString(16) : "");
+                    named.file = s.file;
+                    named.line = s.line;
+                }
+            }
+        }
+        frameNames.set(key, named);
+    }
+    let r = { i: i, ip: hexOf(ctx.rip), sp: hexOf(ctx.rsp), inl: false, text: named.text };
+    if (named.mod) r.mod = named.mod;
+    if (named.fn) r.fn = named.fn;
+    if (named.file) r.file = named.file;
+    if (named.line !== undefined) r.line = named.line;
     return r;
+}
+
+function frameContext(tid, fi) {
+    let frames = walkThread(findThread(tid), fi + 1);
+    if (fi >= frames.length) throw new Error("Frame " + fi + " not found");
+    return frames[fi];
+}
+
+function resetContext() {
+    if (contextFrame === null) return;
+    commandLines(".cxr");
+    contextFrame = null;
+}
+
+// Makes a frame the debugger's scope, for locals and expressions: frame 0 is the thread's own
+// registers, another frame its unwound rip, rsp and rbp as dbgeng's view (like .cxr: the thread
+// itself is unchanged). ChangeRegisterContext takes no other register: the other nonvolatile
+// ones keep the thread's values, which only matters for a local held in one in optimized code.
+function ensureContext(tid, frame) {
+    if (tid === undefined || tid === null) return;
+    let fi = frame || 0;
+    if (num(host.currentThread.Id) !== tid) {
+        resetContext();
+        findThread(tid).SwitchTo();
+    }
+    let key = tid + ":" + fi;
+    if (contextFrame === key || (fi === 0 && contextFrame === null)) return;
+    if (fi === 0) {
+        resetContext();
+        return;
+    }
+    let c = frameContext(tid, fi);
+    host.namespace.Debugger.Utility.Control.ChangeRegisterContext(true, c.rip, c.rsp, c.regs.rbp);
+    contextFrame = key;
+}
+
+// Names of the parameters and locals of the current scope (ensureContext), from `x /1 *`: the
+// data model's frame objects would make dbgeng walk the stack, and `dv` prints the values, which
+// loads the symbols that describe their dynamic types.
+function scopeNames() {
+    let out = [];
+    let seen = new Set();
+    for (let line of commandLines("x /1 *")) {
+        let name = line.trim();
+        if (/^[A-Za-z_$<][^\s]*$/.test(name) && !seen.has(name)) {
+            seen.add(name);
+            out.push(name);
+        }
+    }
+    return out;
 }
 
 // ------------------------------------------------------------------ display
@@ -479,28 +799,21 @@ function makeVar(parent, name, v, hint, evalName, opts) {
 
 function localsOf(e, opts) {
     ensureContext(e.tid, e.fi);
-    let frame = frameAt(findThread(e.tid), e.fi);
     let out = [];
-    let seen = new Set();
-    let sources = [safe(() => frame.Parameters, undefined), safe(() => frame.LocalVariables, undefined)];
-    for (let src of sources) {
-        if (!src) continue;
-        for (let name of propNames(src)) {
-            if (META.has(name) || name.charAt(0) === "<" || seen.has(name)) continue;
-            let v;
-            try { v = src[name]; } catch (err) { out.push({ name: name, value: "<" + errMsg(err) + ">" }); continue; }
-            if (typeof v === "function") continue;
-            seen.add(name);
-            let hint, addr;
-            if (v === null || typeof v !== "object" || isInt64(v)) {
-                try {
-                    let p = host.evaluateExpression("&" + name);
-                    hint = p.targetType.baseType;
-                    addr = hexOf(p.address);
-                } catch (err) { /* register variable: no address */ }
-            }
-            out.push(makeVar(e, name, v, hint, name, { hex: opts.hex, addr: addr }));
+    for (let name of scopeNames()) {
+        if (name.charAt(0) === "<") continue;
+        let v;
+        try { v = host.evaluateExpression(name); } catch (err) { out.push({ name: name, value: "<" + errMsg(err) + ">" }); continue; }
+        if (typeof v === "function") continue;
+        let hint, addr;
+        if (v === null || typeof v !== "object" || isInt64(v)) {
+            try {
+                let p = host.evaluateExpression("&" + name);
+                hint = p.targetType.baseType;
+                addr = hexOf(p.address);
+            } catch (err) { /* register variable: no address */ }
         }
+        out.push(makeVar(e, name, v, hint, name, { hex: opts.hex, addr: addr }));
     }
     return out;
 }
@@ -1003,19 +1316,15 @@ function frameScope(tid, fi) {
     let key = (tid === undefined || tid === null ? "-" : tid) + ":" + (fi || 0);
     let s = frameScopes.get(key);
     if (s) return s;
-    let frame = frameAt(findThread(tid), fi || 0);
-    let names = new Set();
-    for (let src of [safe(() => frame.Parameters, undefined), safe(() => frame.LocalVariables, undefined)]) {
-        if (src) for (let n of propNames(src)) if (!META.has(n)) names.add(n);
-    }
+    let names = new Set(scopeNames());
     let members = new Set();
     if (names.has("this")) {
         let t = safe(() => host.evaluateExpression("this").targetType.baseType, undefined);
         if (t) members = rawMemberNames(t);
     }
-    let si = safe(() => frame.Attributes.SourceInformation, undefined);
-    let fn = si ? safe(() => String(si.FunctionName), undefined) : undefined;
-    let module = si ? safe(() => String(si.Module.Name), undefined) : undefined;
+    let frame = safe(() => frameInfo(frameContext(tid === undefined || tid === null ? num(host.currentThread.Id) : tid, fi || 0), fi || 0), undefined);
+    let fn = frame ? frame.fn : undefined;
+    let module = frame && frame.fn ? frame.mod : undefined;
     s = { names: names, members: members, module: module, scopes: enclosingScopes(fn) };
     frameScopes.set(key, s);
     return s;
@@ -1363,12 +1672,263 @@ function stringOf(v) {
     return s;
 }
 
+// ------------------------------------------------ local symbols, pending breakpoints
+
+// Source and function breakpoints are only ever set qualified with a module whose PDB is loaded:
+// unqualified, dbgeng loads the PDB of every module until it finds the file or the function.
+// The ones no loaded PDB contains wait here: id -> { command, module, tried }. `command` has
+// MODULE_SLOT where the module name goes; `module`, when set, is the only module to try; `tried`
+// holds the modules already tried.
+let pendingBps = new Map();
+const MODULE_SLOT = "@@MODULE@@";
+// Symbol loading at module load: `local` loads the PDB next to the image (modules passing
+// include/exclude), `always` the modules matching it from the whole symbol path.
+let autoLoad = { local: false, include: [], exclude: [], always: [], program: undefined };
+// The symbol path in use is `localPath`: nothing reached over the network, so that a stack walk,
+// which makes dbgeng load the symbols of every module on the stack, never waits on a server.
+// `fullPath`, with the symbol servers, is only used by explicit loads (withFullPath).
+let symbolPaths = { localPath: "", fullPath: "" };
+// Printed while the target runs, when a module load bound a pending breakpoint.
+const MARK_BOUND = "@@WDBGBOUND@@";
+
+function commandLines(command) {
+    let out = [];
+    for (let line of host.namespace.Debugger.Utility.Control.ExecuteCommand(command)) out.push(String(line));
+    return out;
+}
+
+function hasLoadedPdb(m) {
+    let t = safe(() => String(m.SymbolType), "");
+    return /^(pdb|sym)|dia|codeview/i.test(t);
+}
+
+// Modules whose PDB is loaded, optionally only the one at `base`.
+function pdbModules(base) {
+    let out = [];
+    for (let m of host.currentProcess.Modules) {
+        let b = safe(() => num(m.BaseAddress), undefined);
+        if (b === undefined || (base !== undefined && b !== base)) continue;
+        if (hasLoadedPdb(m)) out.push({ name: moduleBaseName(safe(() => String(m.Name), "")), base: b });
+    }
+    return out;
+}
+
+// Tries a pending breakpoint in the modules it was not tried in yet; returns how it bound, or null.
+function bindIn(id, bp, modules) {
+    for (let m of modules) {
+        let key = m.name.toLowerCase() + "@" + m.base;
+        if (bp.tried.has(key) || (bp.module && bp.module.toLowerCase() !== m.name.toLowerCase())) continue;
+        bp.tried.add(key);
+        let output = commandLines(bp.command.split(MODULE_SLOT).join(m.name)).join("\n");
+        let listing = commandLines("bl " + id).join("\n");
+        let row = new RegExp("^\\s*" + id + "\\s+[ed](u?)\\s", "m").exec(listing);
+        if (row && !row[1]) {
+            pendingBps.delete(id);
+            return { id: id, module: m.name, output: output, listing: listing };
+        }
+        commandLines("bc " + id);
+    }
+    return null;
+}
+
+function bindPending(modules) {
+    let bound = [];
+    for (let [id, bp] of Array.from(pendingBps)) {
+        let b = bindIn(id, bp, modules);
+        if (b) bound.push(b);
+    }
+    return bound;
+}
+
+function autoLoadWanted(name) {
+    if (!autoLoad.local) return false;
+    if (autoLoad.include.length > 0 && !autoLoad.include.some(r => r.test(name))) return false;
+    return !autoLoad.exclude.some(r => r.test(name));
+}
+
+function alwaysLoadWanted(name) {
+    return autoLoad.always.some(r => r.test(name));
+}
+
+function setSymbolPath(p) {
+    // An empty path would make dbgeng look for _NT_SYMBOL_PATH again.
+    commandLines(".sympath " + (p || "cache*"));
+}
+
+function loadedPdbNames() {
+    return pdbModules().map(m => m.name);
+}
+
+// Any change of the symbol path makes dbgeng drop the symbols it got from a symbol store (the
+// local cache included): the modules in `keep` that lost theirs load them again, from `p`.
+function changeSymbolPath(p, keep) {
+    setSymbolPath(p);
+    let now = new Set(loadedPdbNames().map(n => n.toLowerCase()));
+    for (let n of new Set(keep)) {
+        if (!now.has(n.toLowerCase())) commandLines("ld " + n);
+    }
+}
+
+// Runs f with the symbol servers in the symbol path. What f downloads lands in the cache, where
+// the local path finds it again.
+function withFullPath(f) {
+    if (symbolPaths.fullPath === symbolPaths.localPath) return f();
+    let before = loadedPdbNames();
+    setSymbolPath(symbolPaths.fullPath);
+    try {
+        return f();
+    } finally {
+        changeSymbolPath(symbolPaths.localPath, before.concat(loadedPdbNames()));
+    }
+}
+
+// Loads a module's symbols at its load: the local PDB, else from the whole symbol path when the
+// module is to be always loaded. True when something was loaded.
+function loadAtModuleLoad(image, name, base) {
+    if (autoLoadWanted(name) && loadLocalPdb(image, name, base)) return true;
+    if (!alwaysLoadWanted(name)) return false;
+    withFullPath(() => commandLines("ld " + name));
+    return true;
+}
+
+function u32(bytes, at) {
+    return (bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24)) >>> 0;
+}
+
+function targetBytes(addr, count) {
+    let out = [];
+    for (let b of host.memory.readMemoryValues(addr, count, 1)) out.push(num(b));
+    return out;
+}
+
+// The PDB identity an image was linked with (its CodeView RSDS record): { guid, age }, or null.
+function imageCodeView(base) {
+    let opt = base + read32(base + 0x3c) + 24;
+    let pe64 = num(host.memory.readMemoryValues(opt, 1, 2)[0]) === 0x20b;
+    let debugDir = opt + (pe64 ? 112 : 96) + 6 * 8;
+    let rva = read32(debugDir);
+    let size = read32(debugDir + 4);
+    for (let at = 0; rva && at + 28 <= size && at < 28 * 64; at += 28) {
+        let entry = targetBytes(base + rva + at, 28);
+        let data = u32(entry, 20);
+        if (u32(entry, 12) !== 2 || !data) continue;
+        let cv = targetBytes(base + data, 24);
+        if (u32(cv, 0) === 0x53445352) return { guid: cv.slice(4, 20), age: u32(cv, 20) };
+    }
+    return null;
+}
+
+// The identity of a PDB file (MSF 7.00): the GUID of its PDB stream and the ages of its PDB and
+// DBI streams. Null when the file is not a PDB.
+function pdbIdentity(path) {
+    let f = host.namespace.Debugger.Utility.FileSystem.OpenFile(path);
+    try {
+        let read = (at, count) => {
+            f.Position = at;
+            let out = [];
+            for (let b of f.ReadBytes(count)) out.push(b);
+            return out;
+        };
+        let header = read(0, 0x38);
+        if (String.fromCharCode.apply(null, header.slice(0, 24)) !== "Microsoft C/C++ MSF 7.00") return null;
+        let blockSize = u32(header, 0x20);
+        let dirBlockCount = Math.ceil(u32(header, 0x2c) / blockSize);
+        let map = read(u32(header, 0x34) * blockSize, dirBlockCount * 4);
+        let dirBlocks = [];
+        for (let i = 0; i < dirBlockCount; i++) dirBlocks.push(u32(map, 4 * i));
+        // Reads `count` bytes at `at` of the stream made of `blocks`.
+        let readStream = (blocks, at, count) => {
+            let out = [];
+            while (count > 0) {
+                let inBlock = at % blockSize;
+                let n = Math.min(count, blockSize - inBlock);
+                out = out.concat(read(blocks[Math.floor(at / blockSize)] * blockSize + inBlock, n));
+                at += n;
+                count -= n;
+            }
+            return out;
+        };
+        let streams = u32(readStream(dirBlocks, 0, 4), 0);
+        if (streams < 4) return null;
+        let sizes = readStream(dirBlocks, 4, 4 * streams);
+        let blockCount = (s) => {
+            let size = u32(sizes, 4 * s);
+            return size === 0xffffffff ? 0 : Math.ceil(size / blockSize);
+        };
+        let streamBlocks = (s) => {
+            let at = 4 + 4 * streams;
+            for (let k = 0; k < s; k++) at += 4 * blockCount(k);
+            let list = readStream(dirBlocks, at, 4 * blockCount(s));
+            let out = [];
+            for (let i = 0; i < list.length; i += 4) out.push(u32(list, i));
+            return out;
+        };
+        let info = readStream(streamBlocks(1), 0, 28);
+        let dbi = readStream(streamBlocks(3), 0, 12);
+        return { guid: info.slice(12, 28), ages: [u32(info, 8), u32(dbi, 8)] };
+    } finally {
+        f.Close();
+    }
+}
+
+// True when the PDB is the one the image was linked with: dbgeng would reject any other and go
+// on searching the whole symbol path, symbol servers included.
+function pdbMatches(base, pdb) {
+    let cv = safe(() => imageCodeView(base), null);
+    let id = cv ? safe(() => pdbIdentity(pdb), null) : null;
+    return !!id && id.guid.every((b, i) => b === cv.guid[i]) && id.ages.indexOf(cv.age) >= 0;
+}
+
+// Loads the PDB next to the image when it is the image's own; true when it was loaded.
+function loadLocalPdb(image, name, base) {
+    let dir = image.replace(/[\\/][^\\/]*$/, "");
+    let pdb = image.replace(/\.[^.\\/]*$/, "") + ".pdb";
+    if (dir === image || !safe(() => host.namespace.Debugger.Utility.FileSystem.FileExists(pdb), false) || !pdbMatches(base, pdb)) return false;
+    // dbgeng looks next to the image only after the whole symbol path: the folder goes first, so
+    // the matching PDB is the first thing found. Once per folder: a change of the symbol path
+    // makes dbgeng try again the modules it found no PDB for.
+    if (!symbolPaths.localPath.split(";").some(p => p.trim().toLowerCase() === dir.toLowerCase())) {
+        let prepend = p => p ? dir + ";" + p : dir;
+        symbolPaths = { localPath: prepend(symbolPaths.localPath), fullPath: prepend(symbolPaths.fullPath) };
+        changeSymbolPath(symbolPaths.localPath, loadedPdbNames());
+    }
+    commandLines("ld " + name);
+    return true;
+}
+
+// Run by the `ld` event filter at every module load, before cdb resumes the target. It must never
+// throw: that would cancel the `gc` that follows it.
+function onModuleLoad() {
+    try {
+        if (!autoLoad.local && autoLoad.always.length === 0) return;
+        let ev = null;
+        for (let line of commandLines(".lastevent")) {
+            let m = /Load module (.+) at ([0-9a-f`]+)\s*$/i.exec(line);
+            if (m) ev = { image: m[1].trim(), base: parseInt(m[2].replace(/`/g, ""), 16) };
+        }
+        if (!ev) return;
+        let name = moduleBaseName(ev.image);
+        if (!loadAtModuleLoad(ev.image, name, ev.base) || pendingBps.size === 0) return;
+        for (let b of bindPending(pdbModules(ev.base))) {
+            host.diagnostics.debugLog(MARK_BOUND + asciiJson(b) + "\n");
+        }
+    } catch (e) {
+        // A failed load leaves the module deferred.
+    }
+}
+
 // --------------------------------------------------------------------- ops
 
 const ops = {
     ping: () => "pong",
 
     reset: () => {
+        walkModules = undefined;
+        walkedStacks.clear();
+        frameNames.clear();
+        // A frame's register view must not outlive the stop.
+        contextFrame = "?";
+        resetContext();
         handles.clear();
         rawMemberCache.clear();
         frameScopes.clear();
@@ -1377,6 +1937,63 @@ const ops = {
     },
 
     pid: () => num(host.currentProcess.Id),
+
+    // { localPath, fullPath, local, include, exclude, always, program }: include, exclude and
+    // always are regular expression sources, matched case-insensitively against module names
+    // without extension.
+    configureSymbols: (req) => {
+        let regexps = list => (list || []).map(s => new RegExp(s, "i"));
+        autoLoad = { local: !!req.local, include: regexps(req.include), exclude: regexps(req.exclude), always: regexps(req.always), program: req.program };
+        symbolPaths = { localPath: req.localPath || "", fullPath: req.fullPath || "" };
+        setSymbolPath(symbolPaths.localPath);
+        return true;
+    },
+
+    // { pattern }: one more module to always load (a regular expression source).
+    addAlwaysLoad: (req) => {
+        autoLoad.always.push(new RegExp(req.pattern, "i"));
+        return true;
+    },
+
+    // { command }: a command that loads symbols on request, run with the symbol servers.
+    explicitLoad: (req) => withFullPath(() => commandLines(req.command).join("\n")),
+
+    // Loads the local PDBs of the modules already loaded (the ones no `ld` event will report).
+    autoLoadExisting: () => {
+        let loaded = [];
+        if (!autoLoad.local && autoLoad.always.length === 0) return loaded;
+        for (let m of host.currentProcess.Modules) {
+            if (safe(() => String(m.SymbolType), "") !== "Deferred") continue;
+            let image = safe(() => String(m.Name), "");
+            let name = moduleBaseName(image);
+            // cdb names the launched exe by its file name only.
+            if (!/[\\/]/.test(image) && autoLoad.program && moduleBaseName(autoLoad.program).toLowerCase() === name.toLowerCase()) image = autoLoad.program;
+            if (/[\\/]/.test(image) && loadAtModuleLoad(image, name, num(m.BaseAddress))) loaded.push(name);
+        }
+        return loaded;
+    },
+
+    // { bps: [{ id, command, module }] }: command is the bu command with MODULE_SLOT where the
+    // module name goes; module, when set, is the only module it may bind in.
+    bindBreakpoints: (req) => {
+        let modules = pdbModules();
+        let bound = [];
+        for (let bp of req.bps) {
+            let rec = { command: bp.command, module: bp.module, tried: new Set() };
+            pendingBps.set(bp.id, rec);
+            let b = bindIn(bp.id, rec, modules);
+            if (b) bound.push(b);
+        }
+        return bound;
+    },
+
+    // Tries the pending breakpoints in the modules whose PDB got loaded since.
+    retryBreakpoints: () => pendingBps.size === 0 ? [] : bindPending(pdbModules()),
+
+    dropBreakpoints: (req) => {
+        for (let id of req.ids) pendingBps.delete(id);
+        return true;
+    },
 
     modules: () => {
         let out = [];
@@ -1411,29 +2028,29 @@ const ops = {
     },
 
     stack: (req) => {
-        let th = findThread(req.tid);
         let start = req.start || 0;
         let levels = req.levels || 1000;
+        let frames = walkThread(findThread(req.tid), start + levels + 1);
         let out = [];
-        let total = 0;
-        for (let f of th.Stack.Frames) {
-            if (total >= start && out.length < levels) out.push(frameInfo(f, total));
-            total++;
-            if (total >= 10000) break;
-        }
-        return { frames: out, total: total };
+        for (let i = start; i < frames.length && out.length < levels; i++) out.push(frameInfo(frames[i], i));
+        let w = walkedStacks.get(num(findThread(req.tid).Id));
+        // An unfinished walk: there are more frames than these.
+        return { frames: out, total: w && w.complete ? frames.length : frames.length + 1 };
     },
 
     where: (req) => {
         let th = host.currentThread;
+        let depth = req.depth || 8;
+        let frames = walkThread(th, depth);
         let out = [];
-        let i = 0;
-        for (let f of th.Stack.Frames) {
-            if (i >= (req.depth || 8)) break;
-            out.push(frameInfo(f, i));
-            i++;
-        }
+        for (let i = 0; i < frames.length && i < depth; i++) out.push(frameInfo(frames[i], i));
         return { tid: num(th.Id), frames: out };
+    },
+
+    // Puts back the threads' own registers as dbgeng's view: before the target runs.
+    resetContext: () => {
+        resetContext();
+        return true;
     },
 
     allStacks: (req) => {
@@ -1442,12 +2059,8 @@ const ops = {
         for (let t of host.currentProcess.Threads) {
             let frames = [];
             try {
-                let i = 0;
-                for (let f of t.Stack.Frames) {
-                    if (i >= max) break;
-                    frames.push(frameInfo(f, i));
-                    i++;
-                }
+                let walked = walkThread(t, max);
+                for (let i = 0; i < walked.length && i < max; i++) frames.push(frameInfo(walked[i], i));
             } catch (err) { /* thread may be exiting */ }
             out.push({ id: num(t.Id), index: safe(() => num(t.Index), out.length), name: safe(() => String(t.Name), ""), frames: frames });
         }
@@ -1460,8 +2073,7 @@ const ops = {
     },
 
     scopes: (req) => {
-        let th = findThread(req.tid);
-        frameAt(th, req.frame);
+        frameContext(num(findThread(req.tid).Id), req.frame || 0);
         let locals = newHandle({ kind: "locals", tid: req.tid, fi: req.frame });
         let regs = newHandle({ kind: "regs", tid: req.tid });
         return { locals: locals, registers: regs };
@@ -1605,5 +2217,5 @@ function vscwdbg(hex) {
 }
 
 function initializeScript() {
-    return [new host.apiVersionSupport(1, 3), new host.functionAlias(vscwdbg, "vscwdbg")];
+    return [new host.apiVersionSupport(1, 3), new host.functionAlias(vscwdbg, "vscwdbg"), new host.functionAlias(onModuleLoad, "vscwdbgld")];
 }

@@ -180,6 +180,35 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Print symbol loading diagnostics (!sym noisy)."
+                  },
+                  "autoLoadLocal": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Load the PDB found next to an exe/dll (same name, .pdb) as soon as the module loads, only when it matches the module: nothing else is searched. Setting a breakpoint never loads symbols: source and function breakpoints only bind in modules whose symbols are loaded."
+                  },
+                  "autoLoadInclude": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules autoLoadLocal applies to: names without extension, * wildcards (e.g. Rsh*). Empty: all modules."
+                  },
+                  "autoLoadExclude": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules autoLoadLocal skips: names without extension, * wildcards (e.g. Qt6*)."
+                  },
+                  "alwaysLoad": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules whose symbols are loaded as soon as they load, from the whole symbol path, symbol servers included: names without extension, * wildcards (e.g. Qt6Core, Rsh*). Other modules only use local symbols (folders and the symbol cache) until Load Symbols. \"Always Load Symbols\" in the Call Stack and Modules views adds to this list."
                   }
                 }
               },
@@ -337,6 +366,35 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Print symbol loading diagnostics (!sym noisy)."
+                  },
+                  "autoLoadLocal": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Load the PDB found next to an exe/dll (same name, .pdb) as soon as the module loads, only when it matches the module: nothing else is searched. Setting a breakpoint never loads symbols: source and function breakpoints only bind in modules whose symbols are loaded."
+                  },
+                  "autoLoadInclude": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules autoLoadLocal applies to: names without extension, * wildcards (e.g. Rsh*). Empty: all modules."
+                  },
+                  "autoLoadExclude": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules autoLoadLocal skips: names without extension, * wildcards (e.g. Qt6*)."
+                  },
+                  "alwaysLoad": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Modules whose symbols are loaded as soon as they load, from the whole symbol path, symbol servers included: names without extension, * wildcards (e.g. Qt6Core, Rsh*). Other modules only use local symbols (folders and the symbol cache) until Load Symbols. \"Always Load Symbols\" in the Call Stack and Modules views adds to this list."
                   }
                 }
               },
@@ -660,6 +718,20 @@
         "command": "windbg.modules.reveal",
         "title": "Reveal in File Explorer",
         "category": "WinDbg"
+      },
+      {
+        "command": "windbg.loadFrameSymbols",
+        "title": "Load Symbols",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.alwaysLoadFrameSymbols",
+        "title": "Always Load Symbols",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.modules.alwaysLoad",
+        "title": "Always Load Symbols"
       }
     ],
     "menus": {
@@ -678,6 +750,16 @@
         }
       ],
       "debug/callstack/context": [
+        {
+          "command": "windbg.loadFrameSymbols",
+          "when": "debugType == 'windbg' && callStackItemType == 'stackFrame'",
+          "group": "4_windbg_symbols@1"
+        },
+        {
+          "command": "windbg.alwaysLoadFrameSymbols",
+          "when": "debugType == 'windbg' && callStackItemType == 'stackFrame'",
+          "group": "4_windbg_symbols@2"
+        },
         {
           "command": "windbg.parallelStacks",
           "when": "debugType == 'windbg'",
@@ -770,9 +852,14 @@
           "group": "1_symbols@1"
         },
         {
-          "command": "windbg.modules.symbolInfo",
+          "command": "windbg.modules.alwaysLoad",
           "when": "view == windbg.modules && viewItem =~ /^module-/",
           "group": "1_symbols@2"
+        },
+        {
+          "command": "windbg.modules.symbolInfo",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "1_symbols@3"
         },
         {
           "command": "windbg.modules.copyPath",
@@ -829,6 +916,18 @@
         },
         {
           "command": "windbg.modules.sortByAddress",
+          "when": "false"
+        },
+        {
+          "command": "windbg.loadFrameSymbols",
+          "when": "false"
+        },
+        {
+          "command": "windbg.alwaysLoadFrameSymbols",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.alwaysLoad",
           "when": "false"
         }
       ]
@@ -901,6 +1000,35 @@
           "type": "boolean",
           "default": false,
           "description": "Print symbol loading diagnostics."
+        },
+        "windbg.symbols.autoLoadLocal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load the PDB found next to an exe/dll (same name, .pdb) as soon as the module loads, only when it matches the module: nothing else is searched. Setting a breakpoint never loads symbols: source and function breakpoints only bind in modules whose symbols are loaded."
+        },
+        "windbg.symbols.autoLoadInclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Modules windbg.symbols.autoLoadLocal applies to: names without extension, * wildcards (e.g. Rsh*). Empty: all modules."
+        },
+        "windbg.symbols.autoLoadExclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Modules windbg.symbols.autoLoadLocal skips: names without extension, * wildcards (e.g. Qt6*)."
+        },
+        "windbg.symbols.alwaysLoad": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Modules whose symbols are loaded as soon as they load, from the whole symbol path, symbol servers included: names without extension, * wildcards (e.g. Qt6Core, Rsh*). Other modules only use local symbols (folders and the symbol cache) until Load Symbols. \"Always Load Symbols\" in the Call Stack and Modules views adds to this list."
         },
         "windbg.natvis.files": {
           "type": "array",

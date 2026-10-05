@@ -176,6 +176,12 @@ opens a WinDbg-style command window beside the editor:
 - **Actions (logpoints)**: the message is printed and execution continues. `{expression}` is
   replaced by its value. The Visual Studio keywords `$FUNCTION`, `$CALLER`, `$CALLSTACK`,
   `$TID`, `$PID`, `$ADDRESS` and `$FILEPOS` work too.
+- **Setting a breakpoint never loads symbols.** A source or function breakpoint binds only in
+  modules whose PDB is already loaded, so it is instant even with hundreds of DLLs loaded. Until
+  then it is grey; it binds as soon as a PDB containing its file or function loads: automatically
+  for local PDBs (see `windbg.symbols.autoLoadLocal`), or with **Load Symbols** in the Modules
+  view. A function breakpoint `module!name` binds in that module only; a bare `name` in the first
+  module that has it.
 
 ### Exceptions
 
@@ -210,6 +216,39 @@ to running sessions.
 | `windbg.symbols.useMicrosoftSymbolServer` | Adds `https://msdl.microsoft.com/download/symbols` (default on) |
 | `windbg.symbols.inheritNtSymbolPath` | Appends `_NT_SYMBOL_PATH` (default on) |
 | `windbg.symbols.verbose` | Prints symbol-loading diagnostics |
+| `windbg.symbols.autoLoadLocal` | Loads the PDB found next to an exe/dll (same name, `.pdb`) as soon as the module loads (default on). Only that file is used, and only when it matches the module (GUID and age): a stale PDB is left alone, never replaced by a search of the symbol path or servers |
+| `windbg.symbols.autoLoadInclude` | Modules `autoLoadLocal` applies to: names without extension, `*` wildcards (e.g. `Rsh*`). Empty: all |
+| `windbg.symbols.autoLoadExclude` | Modules `autoLoadLocal` skips: names without extension, `*` wildcards (e.g. `Qt6*`) |
+
+| `windbg.symbols.alwaysLoad` | Modules whose symbols load as soon as they load, symbol servers included: names without extension, `*` wildcards (e.g. `Qt6Core`, `Rsh*`) |
+
+In a launch configuration the same options go under `"symbols"`: `autoLoadLocal`,
+`autoLoadInclude`, `autoLoadExclude`, `alwaysLoad`.
+
+**A stop loads no symbols.** The engine's own stack walk loads the symbols of every module on
+the stack, so the extension walks stacks itself, from the unwind data of the images (x64), and
+names frames only from symbols already loaded: a frame in a module without them shows as
+`module+0x…`. Locals and expressions of any frame are read the same way. Two differences with the
+engine's walk: inline frames are not shown, and in optimized code a caller's local kept in rbx,
+rsi, rdi or r12-r15 can show the callee's value.
+
+**Symbol servers are only used on request.** The symbol path in use holds only local locations:
+folders, and your symbol cache (`srv*<cache>`), which keeps every PDB downloaded before.
+Servers (and UNC symbol stores and folders) are searched only by:
+
+- **Load Symbols** on a stack frame (Call Stack view) or a module (Modules view), **Load All
+  Symbols**, **Symbol Load Information**, and the hover's "Load Symbols" offer;
+- **Always Load Symbols** on a stack frame or a module, like Visual Studio's "Always Load
+  Automatically": it loads the module's symbols now and adds the module to
+  `windbg.symbols.alwaysLoad` (workspace settings when a folder is open), so they load with the
+  module from then on;
+- the modules in `windbg.symbols.alwaysLoad`. `["*"]` loads everything as it loads.
+
+Commands typed in the Debug Console (`ld`, `.reload /f`) use the local path.
+
+A stop that is never shown (an exception that does not break, a hit count not reached, a
+logpoint without `$FUNCTION`, `$CALLER`, `$CALLSTACK`, `$ADDRESS` or `$FILEPOS`) does not walk the
+stack at all.
 
 The **WinDbg Modules** view (Run and Debug side bar) lists every loaded DLL and EXE, refreshed
 at each stop. For each module:

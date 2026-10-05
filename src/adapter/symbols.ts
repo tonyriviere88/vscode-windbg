@@ -51,6 +51,37 @@ export function buildSymbolPath(opts: SymbolOptions, programDir?: string, env: N
     return parts.join(';');
 }
 
+/** A symbol store or directory reached over the network: an http(s) server or a UNC path. */
+function isRemote(location: string): boolean {
+    return /^https?:/i.test(location) || location.startsWith('\\\\') || location.startsWith('//');
+}
+
+/**
+ * The symbol path used while debugging: `full` without anything reached over the network.
+ * `srv*<cache>*<server>` keeps its local cache (`srv*<cache>`), so PDBs downloaded before are
+ * still found. Servers are only searched by an explicit load (Load Symbols...).
+ */
+export function localSymbolPath(full: string): string {
+    const parts: string[] = [];
+    for (const raw of full.split(';')) {
+        const e = raw.trim();
+        let keep: string | undefined;
+        const store = /^(srv|symsrv\*[^*]*)\*(.*)$/i.exec(e);
+        if (store) {
+            const local = store[2].split('*').filter((s) => s.trim() && !isRemote(s.trim()));
+            keep = local.length > 0 ? `srv*${local.join('*')}` : undefined;
+        } else if (/^cache\*/i.test(e)) {
+            keep = isRemote(e.slice(6)) ? undefined : e;
+        } else if (e && !isRemote(e)) {
+            keep = e;
+        }
+        if (keep && !parts.some((p) => p.toLowerCase() === keep!.toLowerCase())) {
+            parts.push(keep);
+        }
+    }
+    return parts.join(';');
+}
+
 export function buildSourcePath(sourcePaths: string[] | undefined, sourceServer: boolean | undefined): string | undefined {
     const parts = [...(sourcePaths ?? [])].map((p) => p.trim()).filter((p) => p);
     if (sourceServer) {

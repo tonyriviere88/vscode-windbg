@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { WinDbgModule } from './adapter/modules';
+import { addToAlwaysLoad } from './symbolSettings';
 
 type SortOrder = 'name' | 'address';
 
@@ -77,6 +78,7 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
             vscode.commands.registerCommand('windbg.modules.sortByAddress', () => this.setSort('address')),
             vscode.commands.registerCommand('windbg.modules.loadAllSymbols', () => this.loadSymbols(undefined)),
             vscode.commands.registerCommand('windbg.modules.loadSymbols', (item?: ModuleItem) => item && this.loadSymbols(item.module)),
+            vscode.commands.registerCommand('windbg.modules.alwaysLoad', (item?: ModuleItem) => item && this.loadSymbols(item.module, true)),
             vscode.commands.registerCommand('windbg.modules.symbolInfo', (item?: ModuleItem) => item && this.symbolInfo(item.module)),
             vscode.commands.registerCommand('windbg.modules.copyPath', (item?: ModuleItem) => item && vscode.env.clipboard.writeText(item.module.path ?? item.module.name)),
             vscode.commands.registerCommand('windbg.modules.copyPdbPath', (item?: ModuleItem) => item?.module.symbolFilePath && vscode.env.clipboard.writeText(item.module.symbolFilePath)),
@@ -134,16 +136,19 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
         this.changed.fire();
     }
 
-    private async loadSymbols(m: WinDbgModule | undefined): Promise<void> {
+    private async loadSymbols(m: WinDbgModule | undefined, always = false): Promise<void> {
         const s = session();
         if (!s) {
             return;
+        }
+        if (always && m) {
+            await addToAlwaysLoad(m.shortName);
         }
         await vscode.window.withProgress(
             { location: { viewId: 'windbg.modules' }, title: m ? `Loading symbols for ${m.name}` : 'Loading all symbols' },
             async () => {
                 try {
-                    const res = (await s.customRequest('loadSymbols', { module: m?.shortName })) as { modules: WinDbgModule[] };
+                    const res = (await s.customRequest(always ? 'alwaysLoadSymbols' : 'loadSymbols', { module: m?.shortName })) as { modules: WinDbgModule[] };
                     this.update(res.modules);
                     const now = m ? res.modules.find((x) => x.baseAddress === m.baseAddress) : undefined;
                     if (now && now.symbolKind !== 'pdb') {

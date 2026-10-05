@@ -13,6 +13,14 @@ export interface SymbolOptions {
     inheritNtSymbolPath?: boolean;
     /** Prints symbol loading diagnostics (!sym noisy). */
     verbose?: boolean;
+    /** Loads the PDB found next to a module's image as soon as the module loads. */
+    autoLoadLocal?: boolean;
+    /** Modules autoLoadLocal applies to (names without extension, * wildcards); empty: all. */
+    autoLoadInclude?: string[];
+    /** Modules autoLoadLocal skips (names without extension, * wildcards). */
+    autoLoadExclude?: string[];
+    /** Modules whose symbols load as soon as they load, symbol servers included (names, * wildcards). */
+    alwaysLoad?: string[];
 }
 
 export type ConsoleKind = 'externalTerminal' | 'internalConsole';

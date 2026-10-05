@@ -9,6 +9,7 @@ import { ExceptionSettings, activeWinDbgSessions, trackedSessions } from './exce
 import { ModulesView } from './modulesView';
 import { ParallelStacksPanel } from './parallelStacks';
 import { pickProcess } from './processPicker';
+import { addToAlwaysLoad } from './symbolSettings';
 
 interface VariableContext {
     sessionId?: string;
@@ -119,6 +120,39 @@ async function onException(e: ExceptionEvent, exceptions: ExceptionSettings): Pr
     }
 }
 
+/** What VS Code passes to a Call Stack context menu command. */
+interface StackFrameContext {
+    sessionId?: string;
+    frameId?: number;
+}
+
+/** "Load Symbols" / "Always Load Symbols" on a stack frame: loads the symbols of the frame's module. */
+async function loadFrameSymbols(arg: StackFrameContext | undefined, always: boolean, modules: ModulesView): Promise<void> {
+    const session = activeWinDbgSessions().find((s) => s.id === arg?.sessionId) ?? activeWinDbgSessions()[0];
+    const item = vscode.debug.activeStackItem;
+    const frameId = arg?.frameId ?? (item && 'frameId' in item ? item.frameId : undefined);
+    if (!session || frameId === undefined) {
+        void vscode.window.showWarningMessage('No stack frame is selected.');
+        return;
+    }
+    const { module } = (await session.customRequest('frameModule', { frameId })) as { module?: string };
+    if (!module) {
+        void vscode.window.showWarningMessage('This frame is in no module.');
+        return;
+    }
+    if (always) {
+        await addToAlwaysLoad(module);
+    }
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Loading symbols for ${module}` }, async () => {
+        try {
+            await session.customRequest(always ? 'alwaysLoadSymbols' : 'loadSymbols', { module });
+            await modules.refresh();
+        } catch (e) {
+            void vscode.window.showErrorMessage(`Loading symbols failed: ${(e as Error).message}`);
+        }
+    });
+}
+
 /** A hover never loads symbols; this offers to load the ones it was missing. */
 async function onNeedSymbols(session: vscode.DebugSession, e: NeedSymbolsEvent): Promise<void> {
     let offered = offeredSymbols.get(session.id);
@@ -210,6 +244,8 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('windbg.showExternalCode', () => setShowExternalCode(true)),
         vscode.commands.registerCommand('windbg.hideExternalCode', () => setShowExternalCode(false)),
         vscode.commands.registerCommand('windbg.openJmcConfig', () => openJmcConfig()),
+        vscode.commands.registerCommand('windbg.loadFrameSymbols', (arg?: StackFrameContext) => loadFrameSymbols(arg, false, modules)),
+        vscode.commands.registerCommand('windbg.alwaysLoadFrameSymbols', (arg?: StackFrameContext) => loadFrameSymbols(arg, true, modules)),
         vscode.commands.registerCommand('windbg.reloadSymbols', async () => {
             const s = activeWinDbgSessions()[0];
             if (!s) {

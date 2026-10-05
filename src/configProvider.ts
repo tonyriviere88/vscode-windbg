@@ -62,6 +62,10 @@ export class WinDbgConfigurationProvider implements vscode.DebugConfigurationPro
         symbols.useMicrosoftSymbolServer ??= settings.get<boolean>('symbols.useMicrosoftSymbolServer', true);
         symbols.inheritNtSymbolPath ??= settings.get<boolean>('symbols.inheritNtSymbolPath', true);
         symbols.verbose ??= settings.get<boolean>('symbols.verbose', false);
+        symbols.autoLoadLocal ??= settings.get<boolean>('symbols.autoLoadLocal', true);
+        symbols.autoLoadInclude ??= settings.get<string[]>('symbols.autoLoadInclude', []);
+        symbols.autoLoadExclude ??= settings.get<string[]>('symbols.autoLoadExclude', []);
+        symbols.alwaysLoad ??= settings.get<string[]>('symbols.alwaysLoad', []);
         config.symbols = symbols;
 
         const natvis = new Set<string>(substituteAll(settings.get<string[]>('natvis.files', []), folder));
