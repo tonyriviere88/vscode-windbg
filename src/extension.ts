@@ -79,7 +79,7 @@ async function viewString(arg: VariableContext | undefined): Promise<void> {
 
 async function openJmcConfig(): Promise<void> {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    const configured = vscode.workspace.getConfiguration('windbg', folder?.uri).get<string>('justMyCode.configFile', '${workspaceFolder}/.vscode/windbg-jmc.json');
+    const configured = vscode.workspace.getConfiguration('windbg', folder?.uri).get<string>('justMyCode.configFile', '${workspaceFolder}/.vscode/jmc.json');
     if (!folder && configured.includes('${workspaceFolder}')) {
         void vscode.window.showWarningMessage('Open a folder to create a Just My Code configuration.');
         return;

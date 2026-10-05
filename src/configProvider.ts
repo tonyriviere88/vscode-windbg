@@ -78,7 +78,7 @@ export class WinDbgConfigurationProvider implements vscode.DebugConfigurationPro
         delete config.visualizerFile;
 
         config.justMyCode ??= settings.get<boolean>('justMyCode.enabled', true);
-        config.justMyCodeConfig ??= substitute(settings.get<string>('justMyCode.configFile', '${workspaceFolder}/.vscode/windbg-jmc.json'), folder);
+        config.justMyCodeConfig ??= substitute(settings.get<string>('justMyCode.configFile', '${workspaceFolder}/.vscode/jmc.json'), folder);
         config.showExternalCode ??= settings.get<boolean>('justMyCode.showExternalCode', false);
         config.consoleMode ??= settings.get<string>('console.mode', 'commands');
         config.trace ??= settings.get<boolean>('trace', false);

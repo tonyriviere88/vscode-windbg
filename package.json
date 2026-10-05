@@ -480,7 +480,7 @@
               },
               "visualizerFile": "^\"\\${workspaceFolder}/${3:project}.natvis\"",
               "justMyCode": true,
-              "justMyCodeConfig": "^\"\\${workspaceFolder}/.vscode/windbg-jmc.json\""
+              "justMyCodeConfig": "^\"\\${workspaceFolder}/.vscode/jmc.json\""
             }
           },
           {
@@ -922,7 +922,7 @@
         },
         "windbg.justMyCode.configFile": {
           "type": "string",
-          "default": "${workspaceFolder}/.vscode/windbg-jmc.json",
+          "default": "${workspaceFolder}/.vscode/jmc.json",
           "description": "Just My Code rules: external/user symbols (namespaces, classes, functions), files and modules, with * wildcards."
         },
         "windbg.justMyCode.showExternalCode": {
@@ -977,15 +977,15 @@
     "jsonValidation": [
       {
         "fileMatch": [
-          "**/.vscode/windbg-jmc.json",
-          "*.windbg-jmc.json"
+          "**/.vscode/jmc.json",
+          "*.jmc.json"
         ],
         "url": "./schemas/jmc.schema.json"
       }
     ],
     "configurationDefaults": {
       "files.associations": {
-        "**/.vscode/windbg-jmc.json": "jsonc"
+        "**/.vscode/jmc.json": "jsonc"
       }
     }
   }

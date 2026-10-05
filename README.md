@@ -63,7 +63,7 @@ With `justMyCode` on (the default):
   **Show External Code** / **Hide External Code** in the Call Stack context menu.
 
 Code is external when its function, source file or module matches a rule in the configuration
-file. Use **WinDbg: Open Just My Code Configuration** to create `.vscode/windbg-jmc.json` (the
+file. Use **WinDbg: Open Just My Code Configuration** to create `.vscode/jmc.json` (the
 path is set by `windbg.justMyCode.configFile` or `justMyCodeConfig`). The file reloads
 automatically.
 
