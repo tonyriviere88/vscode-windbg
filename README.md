@@ -130,6 +130,10 @@ from:
 - `windbg.natvis.files`,
 - every `*.natvis` in the workspace folder (`windbg.natvis.loadWorkspaceFiles`, on by default).
 
+An edited natvis file is reloaded during the session: at once while the target is stopped (the
+Variables and Watch views refresh), at the next stop while it runs. The list of files is set when the
+session starts, so a natvis file added later needs a restart.
+
 Visualized objects keep a **[Raw View]** child.
 
 ### Threads, call stacks and Parallel Stacks

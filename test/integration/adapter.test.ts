@@ -355,6 +355,36 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 await s.stop();
             }
         });
+
+        it('reloads a natvis file edited while stopped', async () => {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'windbg-natvis-'));
+            const file = path.join(dir, 'sample.natvis');
+            const original = fs.readFileSync(path.join(SAMPLE_DIR, 'sample.natvis'), 'utf8');
+            fs.writeFileSync(file, original);
+            const s = new Session();
+            try {
+                const stopped = s.waitStopped();
+                await s.start({ natvis: [file] }, async () => {
+                    await s.setLines([lineOf('return total;')]);
+                });
+                const tid = (await stopped).body.threadId!;
+                const p1 = async () => {
+                    const top = await s.top(tid);
+                    const shape = find(await s.locals(top.id), 's');
+                    return find(await s.children(find(await s.children(shape), 'points')), '[1]').value;
+                };
+                assert.strictEqual(await p1(), '(3, 4)');
+
+                const invalidated = s.dc.waitForEvent('invalidated', TIMEOUT);
+                fs.writeFileSync(file, original.replace('({x}, {y})', '[{x}; {y}]'));
+                await invalidated;
+                assert.strictEqual(await p1(), '[3; 4]');
+                assert.ok(s.output.some((o) => o.includes(`Reloaded natvis: ${file}`)), s.output.join(''));
+            } finally {
+                await s.stop();
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        });
     });
 
     describe('hover and watch name lookup', () => {

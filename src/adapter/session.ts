@@ -193,6 +193,15 @@ function errorText(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
 }
 
+/** A file's modification time; 0 when it cannot be read. */
+function natvisMtime(file: string): number {
+    try {
+        return fs.statSync(file).mtimeMs;
+    } catch {
+        return 0;
+    }
+}
+
 export class WinDbgSession extends DebugSession {
     private cdb: Cdb | undefined;
     private bridge: Bridge | undefined;
@@ -214,6 +223,11 @@ export class WinDbgSession extends DebugSession {
     private loadAtModuleLoad = false;
     /** The symbol path with the symbol servers, used by explicit loads only. */
     private fullSymbolPath = '';
+    /** User natvis file -> its modification time when last loaded; 0: missing. */
+    private natvisMtimes = new Map<string, number>();
+    /** One watcher per folder holding a user natvis file: editors often save by replacing the file. */
+    private natvisWatchers: fs.FSWatcher[] = [];
+    private natvisTimer: NodeJS.Timeout | undefined;
 
     private bpById = new Map<number, BpRecord>();
     private sourceBps = new Map<string, BpRecord[]>();
@@ -515,13 +529,10 @@ export class WinDbgSession extends DebugSession {
 
         const natvis = [...(Array.isArray(args.visualizerFile) ? args.visualizerFile : args.visualizerFile ? [args.visualizerFile] : []), ...(args.natvis ?? [])];
         for (const file of [...new Set(natvis)]) {
-            const out = await cdb.exec(`.nvload ${file.includes(' ') ? `"${file}"` : file}`);
-            if (/error|fail|unable/i.test(out) && !/successfully loaded/i.test(out)) {
-                this.log(`natvis ${file}: ${out.trim()}`, 'stderr');
-            } else {
-                this.log(`Loaded natvis: ${file}`);
-            }
+            this.natvisMtimes.set(file, natvisMtime(file));
+            await this.loadNatvis(file, false);
         }
+        this.watchNatvis();
         const sym = args.symbols ?? {};
         const always = modulePatterns(sym.alwaysLoad);
         this.loadAtModuleLoad = sym.autoLoadLocal !== false || always.length > 0;
@@ -710,6 +721,8 @@ export class WinDbgSession extends DebugSession {
                     this.notifyStopWaiters();
                     return;
                 }
+                // A natvis file edited while the target ran applies to the values about to be shown.
+                await this.reloadChangedNatvis();
                 this.reportStop(decision);
                 return;
             }
@@ -1074,6 +1087,87 @@ export class WinDbgSession extends DebugSession {
         );
     }
 
+    /** Loads a user natvis file; `reload` unloads it first, as cdb ignores a file it already loaded. */
+    private async loadNatvis(file: string, reload: boolean): Promise<void> {
+        const quoted = file.includes(' ') ? `"${file}"` : file;
+        if (reload) {
+            await this.exec(`.nvunload ${quoted}`);
+        }
+        const out = await this.exec(`.nvload ${quoted}`);
+        if (/error|fail|unable/i.test(out) && !/successfully loaded/i.test(out)) {
+            this.log(`natvis ${file}: ${out.trim()}`, 'stderr');
+        } else {
+            this.log(`${reload ? 'Reloaded' : 'Loaded'} natvis: ${file}`);
+        }
+    }
+
+    /** Reloads the user natvis files changed on disk since they were loaded; true when one was. */
+    private async reloadChangedNatvis(): Promise<boolean> {
+        let changed = false;
+        for (const [file, loaded] of this.natvisMtimes) {
+            const mtime = natvisMtime(file);
+            // A deleted file stays loaded: it is reloaded once it is back.
+            if (mtime === loaded || mtime === 0) {
+                continue;
+            }
+            this.natvisMtimes.set(file, mtime);
+            await this.loadNatvis(file, true);
+            changed = true;
+        }
+        return changed;
+    }
+
+    /**
+     * Watches the user natvis files: a change applies at once while the target is stopped, and at the
+     * next stop otherwise (breaking in only to reload a visualizer would disturb the program).
+     */
+    private watchNatvis(): void {
+        const byFolder = new Map<string, Set<string>>();
+        for (const file of this.natvisMtimes.keys()) {
+            const full = path.resolve(file);
+            const folder = path.dirname(full);
+            byFolder.set(folder, (byFolder.get(folder) ?? new Set()).add(path.basename(full).toLowerCase()));
+        }
+        for (const [folder, names] of byFolder) {
+            try {
+                const watcher = fs.watch(folder, (_event, name) => {
+                    if (!name || names.has(name.toString().toLowerCase())) {
+                        this.natvisChanged();
+                    }
+                });
+                watcher.on('error', () => watcher.close());
+                this.natvisWatchers.push(watcher);
+            } catch (e) {
+                this.trace(`[natvis] cannot watch ${folder}: ${errorText(e)}\n`);
+            }
+        }
+    }
+
+    private natvisChanged(): void {
+        clearTimeout(this.natvisTimer);
+        // An editor saves in several writes: reload after the last one.
+        this.natvisTimer = setTimeout(() => {
+            if (this.state !== 'stopped') {
+                return;
+            }
+            this.reloadChangedNatvis().then(
+                (changed) => {
+                    if (changed && this.state === 'stopped') {
+                        this.sendEvent(new InvalidatedEvent(['variables']));
+                    }
+                },
+                (e) => this.log(`Reloading natvis failed: ${errorText(e)}`, 'stderr'),
+            );
+        }, 300);
+    }
+
+    private unwatchNatvis(): void {
+        clearTimeout(this.natvisTimer);
+        for (const watcher of this.natvisWatchers.splice(0)) {
+            watcher.close();
+        }
+    }
+
     /** Runs a job while the target is stopped, breaking in (and resuming afterwards) if it is running. */
     private runWhenStopped<T>(job: () => Promise<T>): Promise<T> {
         if (this.state !== 'running') {
@@ -1218,6 +1312,7 @@ export class WinDbgSession extends DebugSession {
     // ------------------------------------------------------ termination
 
     private sendTerminated(): void {
+        this.unwatchNatvis();
         if (!this.terminatedSent) {
             this.terminatedSent = true;
             this.sendEvent(new TerminatedEvent());
@@ -1225,6 +1320,7 @@ export class WinDbgSession extends DebugSession {
     }
 
     private async stopEngine(terminateDebuggee: boolean): Promise<void> {
+        this.unwatchNatvis();
         const cdb = this.cdb;
         if (!cdb || cdb.exited) {
             return;
