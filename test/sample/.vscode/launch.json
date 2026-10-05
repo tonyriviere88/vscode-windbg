@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "WinDbg: Launch sample",
+      "type": "windbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/sample.exe",
+      "args": ["wait"],
+      "cwd": "${workspaceFolder}",
+      "console": "externalTerminal"
+    },
+    {
+      "name": "WinDbg: Attach",
+      "type": "windbg",
+      "request": "attach",
+      "processId": "${command:windbg.pickProcess}"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+  <Type Name="app::Point">
+    <DisplayString>({x}, {y})</DisplayString>
+    <Expand>
+      <Item Name="[x]">x</Item>
+      <Item Name="[y]">y</Item>
+      <Item Name="[length^2]">x * x + y * y</Item>
+    </Expand>
+  </Type>
+</AutoVisualizer>

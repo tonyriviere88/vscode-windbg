@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WinDbg Just My Code rules",
+  "type": "object",
+  "definitions": {
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "symbols": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Namespaces, classes or functions. \"std\" matches std::* and std<...>; '*' and '?' are wildcards; \"module!pattern\" also checks the module."
+        },
+        "files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Source files or directories. Absolute paths match as prefixes, relative ones anywhere in the path; '*' and '?' are wildcards; ${workspaceFolder} is supported."
+        },
+        "modules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Module names without extension; '*' and '?' are wildcards."
+        }
+      }
+    }
+  },
+  "properties": {
+    "inheritDefaults": {
+      "type": "boolean",
+      "default": true,
+      "description": "Keep the built-in external rules (STL, CRT, Windows SDK and system modules)."
+    },
+    "external": {
+      "$ref": "#/definitions/rules",
+      "description": "Code matching these rules is external: stepping skips it and the call stack collapses it."
+    },
+    "user": {
+      "$ref": "#/definitions/rules",
+      "description": "Code matching these rules is always user code, even when an external rule matches."
+    }
+  }
+}

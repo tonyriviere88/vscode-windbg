@@ -1,0 +1,193 @@
+html,
+body {
+    height: 100%;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0;
+    margin: 0;
+    background: var(--vscode-editor-background, #1e1e1e);
+    color: var(--vscode-editor-foreground, #d4d4d4);
+    font-family: var(--vscode-font-family, sans-serif);
+    font-size: var(--vscode-font-size, 13px);
+}
+
+.toolbar {
+    flex: none;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 6px 12px;
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-editorWidget-foreground, #cccccc);
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #454545);
+}
+
+.toolbar button {
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ffffff);
+    border: none;
+    padding: 3px 10px;
+    cursor: pointer;
+}
+
+.toolbar button:hover {
+    background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+#status {
+    color: var(--vscode-descriptionForeground, #a0a0a0);
+}
+
+#stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+}
+
+#viewport {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+    cursor: grab;
+}
+
+#viewport.panning,
+#viewport.panning .box .frame {
+    cursor: grabbing;
+    user-select: none;
+}
+
+#canvas {
+    position: relative;
+    margin: 0;
+}
+
+#minimap {
+    /* Colours read by the script when it draws the graph. */
+    --ps-box: var(--vscode-editorIndentGuide-activeBackground, #707070);
+    --ps-current: var(--vscode-focusBorder, #007fd4);
+    --ps-link: var(--vscode-editorIndentGuide-background, #404040);
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    z-index: 2;
+    padding: 4px;
+    background: var(--vscode-editorWidget-background, #252526);
+    border: 1px solid var(--vscode-editorWidget-border, #454545);
+    border-radius: 3px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+    cursor: pointer;
+    user-select: none;
+}
+
+#minimap[hidden] {
+    display: none;
+}
+
+#minimapGraph {
+    display: block;
+}
+
+#minimapView {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid var(--vscode-focusBorder, #007fd4);
+    background: var(--vscode-minimapSlider-background, rgba(121, 121, 121, 0.2));
+    cursor: grab;
+}
+
+#minimapView:hover {
+    background: var(--vscode-minimapSlider-hoverBackground, rgba(100, 100, 100, 0.35));
+}
+
+#minimap.dragging #minimapView {
+    background: var(--vscode-minimapSlider-activeBackground, rgba(191, 191, 191, 0.2));
+    cursor: grabbing;
+}
+
+#canvas.stale {
+    opacity: 1;
+    filter: grayscale(0.8);
+}
+
+svg.links {
+    position: absolute;
+    left: 0;
+    top: 0;
+    pointer-events: none;
+}
+
+svg.links path {
+    fill: none;
+    stroke: var(--vscode-editorIndentGuide-activeBackground, #707070);
+    stroke-width: 1.5;
+}
+
+svg.links .arrowhead {
+    fill: var(--vscode-editorIndentGuide-activeBackground, #707070);
+    stroke: none;
+}
+
+.box {
+    position: absolute;
+    box-sizing: border-box;
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-editorWidget-foreground, #cccccc);
+    border: 1px solid var(--vscode-editorWidget-border, #454545);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.box.current {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.box .header {
+    height: 26px;
+    line-height: 26px;
+    padding: 0 8px;
+    font-weight: 600;
+    background: var(--vscode-sideBarSectionHeader-background, #2d2d30);
+    color: var(--vscode-sideBarSectionHeader-foreground, #e0e0e0);
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #454545);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.box .frame {
+    height: 20px;
+    line-height: 20px;
+    padding: 0 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 12px;
+    color: var(--vscode-editorWidget-foreground, #cccccc);
+}
+
+.box .frame:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+    color: var(--vscode-list-hoverForeground, #ffffff);
+}
+
+.box .frame.selected {
+    background: var(--vscode-list-activeSelectionBackground, #04395e);
+    color: var(--vscode-list-activeSelectionForeground, #ffffff);
+}
+
+.box .frame.external {
+    font-style: italic;
+    color: var(--vscode-descriptionForeground, #a0a0a0);
+}
+
+.box .marker {
+    color: var(--vscode-debugIcon-breakpointCurrentStackframeForeground, #ffcc00);
+    margin-right: 4px;
+}

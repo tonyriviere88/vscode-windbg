@@ -1,0 +1,180 @@
+html,
+body {
+    height: 100%;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0;
+    margin: 0;
+    background: var(--vscode-editor-background, #1e1e1e);
+    color: var(--vscode-editor-foreground, #d4d4d4);
+    font-family: var(--vscode-font-family, sans-serif);
+    font-size: var(--vscode-font-size, 13px);
+}
+
+.toolbar {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 5px 10px;
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-editorWidget-foreground, #cccccc);
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #454545);
+}
+
+.toolbar button {
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ffffff);
+    border: none;
+    padding: 3px 10px;
+    cursor: pointer;
+}
+
+.toolbar button:hover:not(:disabled) {
+    background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.toolbar button:disabled {
+    cursor: default;
+    color: var(--vscode-disabledForeground, #8b8b8b);
+}
+
+.toolbar button.quickCommand {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 12px;
+}
+
+.toolbar button.icon {
+    padding: 3px 6px;
+}
+
+.toolbar .separator {
+    width: 1px;
+    align-self: stretch;
+    background: var(--vscode-editorWidget-border, #454545);
+    margin: 0 4px;
+}
+
+.toolbar .spacer {
+    flex: 1;
+}
+
+#quick {
+    display: contents;
+}
+
+#output {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 6px 10px;
+    margin: 0;
+    outline: none;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+    line-height: 1.4;
+    background: var(--vscode-editor-background, #1e1e1e);
+    color: var(--vscode-editor-foreground, #d4d4d4);
+    cursor: text;
+}
+
+#output.nowrap {
+    white-space: pre;
+    overflow-wrap: normal;
+}
+
+.entry.info {
+    color: var(--vscode-descriptionForeground, #a0a0a0);
+}
+
+.entry.error,
+.entry.stderr {
+    color: var(--vscode-errorForeground, #f48771);
+}
+
+.entry.event {
+    color: var(--vscode-debugIcon-breakpointCurrentStackframeForeground, #ffcc00);
+    font-weight: 600;
+}
+
+.echoPrompt {
+    color: var(--vscode-terminal-ansiBlue, #569cd6);
+}
+
+.echoCommand {
+    font-weight: 600;
+}
+
+#output a.source {
+    color: var(--vscode-textLink-foreground, #3794ff);
+    text-decoration: none;
+    cursor: pointer;
+}
+
+#output a.source:hover {
+    color: var(--vscode-textLink-activeForeground, #3794ff);
+    text-decoration: underline;
+}
+
+#output .address {
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+}
+
+#output .address:hover {
+    color: var(--vscode-textLink-activeForeground, #3794ff);
+}
+
+.inputRow {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-editorWidget-foreground, #cccccc);
+    border-top: 1px solid var(--vscode-editorWidget-border, #454545);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+}
+
+#prompt {
+    flex: none;
+    color: var(--vscode-terminal-ansiBlue, #569cd6);
+    white-space: pre;
+}
+
+#prompt.busy {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+#prompt.none {
+    color: var(--vscode-descriptionForeground, #a0a0a0);
+}
+
+#input {
+    flex: 1;
+    min-width: 0;
+    padding: 3px 6px;
+    font: inherit;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #cccccc);
+    border: 1px solid var(--vscode-input-border, transparent);
+    outline: none;
+}
+
+#input:focus {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+#input::placeholder {
+    color: var(--vscode-input-placeholderForeground, #a6a6a6);
+}

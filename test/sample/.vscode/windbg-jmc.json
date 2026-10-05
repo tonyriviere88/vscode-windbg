@@ -1,0 +1,14 @@
+{
+    // Just My Code rules for the sample. See schemas/jmc.schema.json.
+    "inheritDefaults": true,
+    "external": {
+        "symbols": [],
+        "files": [],
+        "modules": []
+    },
+    "user": {
+        "symbols": [],
+        "files": [],
+        "modules": []
+    }
+}

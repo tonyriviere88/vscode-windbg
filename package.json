@@ -1,0 +1,992 @@
+{
+  "name": "vscode-windbg",
+  "displayName": "WinDbg Debugger",
+  "description": "Debug native Windows applications (C/C++) in VS Code with the WinDbg engine: Just My Code, natvis, parallel stacks, exception settings and symbol servers.",
+  "version": "0.1.0",
+  "publisher": "vscode",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "keywords": [
+    "windbg",
+    "cdb",
+    "dbgeng",
+    "c++",
+    "natvis",
+    "debugger"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onDebugResolve:windbg",
+    "onDebugDynamicConfigurations:windbg",
+    "onCommand:windbg.pickProcess",
+    "onView:windbg.exceptions",
+    "onView:windbg.modules"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test:unit": "npm run compile && node --test \"out/test/unit/*.test.js\"",
+    "test:integration": "npm run compile && node --test --test-concurrency=1 \"out/test/integration/*.test.js\"",
+    "test:e2e": "npm run compile && node out/test/e2e/runTest.js",
+    "test": "npm run compile && node --test --test-concurrency=1 \"out/test/unit/*.test.js\" \"out/test/integration/*.test.js\"",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.90.0",
+    "@vscode/debugadapter-testsupport": "^1.68.0",
+    "@vscode/test-electron": "^3.1.0",
+    "typescript": "^7.0.2"
+  },
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "c"
+      },
+      {
+        "language": "cpp"
+      },
+      {
+        "language": "cuda-cpp"
+      },
+      {
+        "language": "rust"
+      },
+      {
+        "language": "objective-c"
+      },
+      {
+        "language": "objective-cpp"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "windbg",
+        "label": "WinDbg (C/C++)",
+        "languages": [
+          "c",
+          "cpp",
+          "rust"
+        ],
+        "variables": {
+          "pickProcess": "windbg.pickProcess"
+        },
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path of the executable to debug."
+              },
+              "args": {
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "default": [],
+                "description": "Command line arguments (array, or a string passed verbatim)."
+              },
+              "cwd": {
+                "type": "string",
+                "default": "${workspaceFolder}",
+                "description": "Working directory of the program."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "default": {},
+                "description": "Environment variables added to (null: removed from) the program environment."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Break at main / wmain / WinMain."
+              },
+              "console": {
+                "enum": [
+                  "externalTerminal",
+                  "internalConsole"
+                ],
+                "default": "externalTerminal",
+                "enumDescriptions": [
+                  "Console programs get their own console window.",
+                  "Program output goes to the Debug Console (no input)."
+                ],
+                "description": "Where the program's console goes."
+              },
+              "dumpFile": {
+                "type": "string",
+                "description": "Open a crash dump (.dmp) instead of launching a program."
+              },
+              "debuggerPath": {
+                "type": "string",
+                "description": "Path to cdb.exe (or its directory). Defaults to the windbg.debuggerPath setting, then the Windows SDK Debugging Tools."
+              },
+              "symbols": {
+                "type": "object",
+                "description": "Symbol (PDB) settings. Overrides the windbg.symbols.* settings.",
+                "properties": {
+                  "cachePath": {
+                    "type": "string",
+                    "description": "Local directory where downloaded PDBs are cached."
+                  },
+                  "searchPaths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Directories searched for PDB files (flat layout)."
+                  },
+                  "servers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Symbol servers: http(s) URLs or UNC symbol stores. Entries already starting with srv* or cache* are used as is."
+                  },
+                  "useMicrosoftSymbolServer": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Add https://msdl.microsoft.com/download/symbols."
+                  },
+                  "inheritNtSymbolPath": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Append _NT_SYMBOL_PATH from the environment."
+                  },
+                  "verbose": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Print symbol loading diagnostics (!sym noisy)."
+                  }
+                }
+              },
+              "symbolPath": {
+                "type": "string",
+                "description": "Raw dbgeng symbol path. When set, it replaces the path built from \"symbols\"."
+              },
+              "sourcePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Source search directories (.srcpath)."
+              },
+              "sourceServer": {
+                "type": "boolean",
+                "default": false,
+                "description": "Retrieve sources from source servers (srcsrv)."
+              },
+              "sourceFileMap": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Maps compile-time source paths to local paths, e.g. {\"C:\\\\build\\\\src\": \"${workspaceFolder}\\\\src\"}."
+              },
+              "visualizerFile": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "description": "Natvis file(s) to load in addition to the windbg.natvis.* settings."
+              },
+              "natvis": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Natvis files to load."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "default": true,
+                "description": "Step over external code and collapse it in the call stack."
+              },
+              "justMyCodeConfig": {
+                "type": "string",
+                "description": "Just My Code rules file. Defaults to the windbg.justMyCode.configFile setting."
+              },
+              "showExternalCode": {
+                "type": "boolean",
+                "default": false,
+                "description": "Show external frames in the call stack instead of [External Code]."
+              },
+              "initCommands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Debugger commands executed after the target is loaded, before breakpoints are set."
+              },
+              "consoleMode": {
+                "enum": [
+                  "commands",
+                  "expressions"
+                ],
+                "default": "commands",
+                "description": "How the Debug Console interprets input. In 'commands' mode use 'dx <expr>' for an expandable value; in 'expressions' mode use '-exec <command>' for debugger commands."
+              },
+              "evaluationTimeout": {
+                "type": "number",
+                "default": 10,
+                "minimum": 0,
+                "description": "Seconds after which an evaluation (watch, hover, Variables view, logpoint) is interrupted and reported as an error, so the debugger never hangs on one. 0 waits forever."
+              },
+              "hexadecimalDisplay": {
+                "type": "boolean",
+                "default": false,
+                "description": "Show integers in hexadecimal."
+              },
+              "trace": {
+                "type": "boolean",
+                "default": false,
+                "description": "Log the communication with cdb to the Debug Console."
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "processId": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "default": "${command:windbg.pickProcess}",
+                "description": "Id of the process to attach to."
+              },
+              "processName": {
+                "type": "string",
+                "description": "Name of the process to attach to (when processId is not set)."
+              },
+              "nonInvasive": {
+                "type": "boolean",
+                "default": false,
+                "description": "Attach without stopping the process for debugging events (inspection only)."
+              },
+              "debuggerPath": {
+                "type": "string",
+                "description": "Path to cdb.exe (or its directory). Defaults to the windbg.debuggerPath setting, then the Windows SDK Debugging Tools."
+              },
+              "symbols": {
+                "type": "object",
+                "description": "Symbol (PDB) settings. Overrides the windbg.symbols.* settings.",
+                "properties": {
+                  "cachePath": {
+                    "type": "string",
+                    "description": "Local directory where downloaded PDBs are cached."
+                  },
+                  "searchPaths": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Directories searched for PDB files (flat layout)."
+                  },
+                  "servers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Symbol servers: http(s) URLs or UNC symbol stores. Entries already starting with srv* or cache* are used as is."
+                  },
+                  "useMicrosoftSymbolServer": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Add https://msdl.microsoft.com/download/symbols."
+                  },
+                  "inheritNtSymbolPath": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Append _NT_SYMBOL_PATH from the environment."
+                  },
+                  "verbose": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Print symbol loading diagnostics (!sym noisy)."
+                  }
+                }
+              },
+              "symbolPath": {
+                "type": "string",
+                "description": "Raw dbgeng symbol path. When set, it replaces the path built from \"symbols\"."
+              },
+              "sourcePaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Source search directories (.srcpath)."
+              },
+              "sourceServer": {
+                "type": "boolean",
+                "default": false,
+                "description": "Retrieve sources from source servers (srcsrv)."
+              },
+              "sourceFileMap": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Maps compile-time source paths to local paths, e.g. {\"C:\\\\build\\\\src\": \"${workspaceFolder}\\\\src\"}."
+              },
+              "visualizerFile": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "description": "Natvis file(s) to load in addition to the windbg.natvis.* settings."
+              },
+              "natvis": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Natvis files to load."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "default": true,
+                "description": "Step over external code and collapse it in the call stack."
+              },
+              "justMyCodeConfig": {
+                "type": "string",
+                "description": "Just My Code rules file. Defaults to the windbg.justMyCode.configFile setting."
+              },
+              "showExternalCode": {
+                "type": "boolean",
+                "default": false,
+                "description": "Show external frames in the call stack instead of [External Code]."
+              },
+              "initCommands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Debugger commands executed after the target is loaded, before breakpoints are set."
+              },
+              "consoleMode": {
+                "enum": [
+                  "commands",
+                  "expressions"
+                ],
+                "default": "commands",
+                "description": "How the Debug Console interprets input. In 'commands' mode use 'dx <expr>' for an expandable value; in 'expressions' mode use '-exec <command>' for debugger commands."
+              },
+              "evaluationTimeout": {
+                "type": "number",
+                "default": 10,
+                "minimum": 0,
+                "description": "Seconds after which an evaluation (watch, hover, Variables view, logpoint) is interrupted and reported as an error, so the debugger never hangs on one. 0 waits forever."
+              },
+              "hexadecimalDisplay": {
+                "type": "boolean",
+                "default": false,
+                "description": "Show integers in hexadecimal."
+              },
+              "trace": {
+                "type": "boolean",
+                "default": false,
+                "description": "Log the communication with cdb to the Debug Console."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "WinDbg: Launch",
+            "type": "windbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/app.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "console": "externalTerminal"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "WinDbg: Launch",
+            "description": "Launch a program under the WinDbg engine",
+            "body": {
+              "name": "WinDbg: Launch",
+              "type": "windbg",
+              "request": "launch",
+              "program": "^\"\\${workspaceFolder}/build/Debug/${1:app}.exe\"",
+              "args": [],
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "stopOnEntry": false,
+              "console": "externalTerminal"
+            }
+          },
+          {
+            "label": "WinDbg: Launch with symbols and natvis",
+            "description": "Launch with symbol servers, a symbol cache and natvis files",
+            "body": {
+              "name": "WinDbg: Launch (symbols)",
+              "type": "windbg",
+              "request": "launch",
+              "program": "^\"\\${workspaceFolder}/build/Debug/${1:app}.exe\"",
+              "args": [],
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "symbols": {
+                "cachePath": "${2:C:/Symbols}",
+                "searchPaths": [
+                  "^\"\\${workspaceFolder}/build/Debug\""
+                ],
+                "servers": [
+                  "https://msdl.microsoft.com/download/symbols"
+                ]
+              },
+              "visualizerFile": "^\"\\${workspaceFolder}/${3:project}.natvis\"",
+              "justMyCode": true,
+              "justMyCodeConfig": "^\"\\${workspaceFolder}/.vscode/windbg-jmc.json\""
+            }
+          },
+          {
+            "label": "WinDbg: Launch (output in Debug Console)",
+            "description": "Launch with program output in the Debug Console",
+            "body": {
+              "name": "WinDbg: Launch (internal console)",
+              "type": "windbg",
+              "request": "launch",
+              "program": "^\"\\${workspaceFolder}/build/Debug/${1:app}.exe\"",
+              "args": [],
+              "console": "internalConsole"
+            }
+          },
+          {
+            "label": "WinDbg: Attach to Process",
+            "description": "Pick a running process and attach",
+            "body": {
+              "name": "WinDbg: Attach",
+              "type": "windbg",
+              "request": "attach",
+              "processId": "^\"\\${command:windbg.pickProcess}\""
+            }
+          },
+          {
+            "label": "WinDbg: Attach by Name",
+            "description": "Attach to a running process by executable name",
+            "body": {
+              "name": "WinDbg: Attach by Name",
+              "type": "windbg",
+              "request": "attach",
+              "processName": "${1:app.exe}"
+            }
+          },
+          {
+            "label": "WinDbg: Open Crash Dump",
+            "description": "Inspect a .dmp file",
+            "body": {
+              "name": "WinDbg: Crash Dump",
+              "type": "windbg",
+              "request": "launch",
+              "dumpFile": "${1:C:/dumps/app.dmp}",
+              "symbols": {
+                "searchPaths": [
+                  "^\"\\${workspaceFolder}/build/Debug\""
+                ]
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "windbg.parallelStacks",
+        "title": "Show Parallel Stacks",
+        "category": "WinDbg",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "windbg.commandWindow",
+        "title": "Show Command Window",
+        "category": "WinDbg",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "windbg.viewString",
+        "title": "View String",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.showExternalCode",
+        "title": "Show External Code",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.hideExternalCode",
+        "title": "Hide External Code",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.openJmcConfig",
+        "title": "Open Just My Code Configuration",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.reloadSymbols",
+        "title": "Reload Symbols",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.toggleHex",
+        "title": "Toggle Hexadecimal Display",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.pickProcess",
+        "title": "Pick Process to Attach",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.exceptions.addCpp",
+        "title": "Add C++ Exception Type",
+        "category": "WinDbg",
+        "icon": "$(add)"
+      },
+      {
+        "command": "windbg.exceptions.addWin32",
+        "title": "Add Win32 Exception",
+        "category": "WinDbg",
+        "icon": "$(symbol-event)"
+      },
+      {
+        "command": "windbg.exceptions.remove",
+        "title": "Remove",
+        "category": "WinDbg",
+        "icon": "$(close)"
+      },
+      {
+        "command": "windbg.exceptions.reset",
+        "title": "Remove All Exception Overrides",
+        "category": "WinDbg",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "windbg.exceptions.show",
+        "title": "Show Exception Settings",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.modules.refresh",
+        "title": "Refresh Modules",
+        "category": "WinDbg",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "windbg.modules.loadAllSymbols",
+        "title": "Load All Symbols",
+        "category": "WinDbg",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "windbg.modules.sortByName",
+        "title": "Sort by Name",
+        "category": "WinDbg",
+        "icon": "$(sort-precedence)"
+      },
+      {
+        "command": "windbg.modules.sortByAddress",
+        "title": "Sort by Load Address",
+        "category": "WinDbg",
+        "icon": "$(list-ordered)"
+      },
+      {
+        "command": "windbg.modules.loadSymbols",
+        "title": "Load Symbols",
+        "category": "WinDbg",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "windbg.modules.symbolInfo",
+        "title": "Symbol Load Information",
+        "category": "WinDbg",
+        "icon": "$(info)"
+      },
+      {
+        "command": "windbg.modules.copyPath",
+        "title": "Copy Path",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.modules.copyPdbPath",
+        "title": "Copy PDB Path",
+        "category": "WinDbg"
+      },
+      {
+        "command": "windbg.modules.reveal",
+        "title": "Reveal in File Explorer",
+        "category": "WinDbg"
+      }
+    ],
+    "menus": {
+      "debug/variables/context": [
+        {
+          "command": "windbg.viewString",
+          "when": "debugType == 'windbg'",
+          "group": "5_windbg"
+        }
+      ],
+      "debug/watch/context": [
+        {
+          "command": "windbg.viewString",
+          "when": "debugType == 'windbg'",
+          "group": "5_windbg"
+        }
+      ],
+      "debug/callstack/context": [
+        {
+          "command": "windbg.parallelStacks",
+          "when": "debugType == 'windbg'",
+          "group": "5_windbg"
+        },
+        {
+          "command": "windbg.commandWindow",
+          "when": "debugType == 'windbg'",
+          "group": "5_windbg"
+        },
+        {
+          "command": "windbg.showExternalCode",
+          "when": "debugType == 'windbg' && !windbg.showExternalCode",
+          "group": "5_windbg"
+        },
+        {
+          "command": "windbg.hideExternalCode",
+          "when": "debugType == 'windbg' && windbg.showExternalCode",
+          "group": "5_windbg"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "windbg.parallelStacks",
+          "when": "debugType == 'windbg'",
+          "group": "navigation@100"
+        },
+        {
+          "command": "windbg.commandWindow",
+          "when": "debugType == 'windbg'",
+          "group": "navigation@101"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "windbg.exceptions.addCpp",
+          "when": "view == windbg.exceptions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "windbg.exceptions.addWin32",
+          "when": "view == windbg.exceptions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "windbg.exceptions.reset",
+          "when": "view == windbg.exceptions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "windbg.modules.refresh",
+          "when": "view == windbg.modules",
+          "group": "navigation@1"
+        },
+        {
+          "command": "windbg.modules.loadAllSymbols",
+          "when": "view == windbg.modules",
+          "group": "navigation@2"
+        },
+        {
+          "command": "windbg.modules.sortByAddress",
+          "when": "view == windbg.modules && windbg.modules.sort == name",
+          "group": "navigation@3"
+        },
+        {
+          "command": "windbg.modules.sortByName",
+          "when": "view == windbg.modules && windbg.modules.sort == address",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "windbg.exceptions.remove",
+          "when": "view == windbg.exceptions && viewItem == override",
+          "group": "inline"
+        },
+        {
+          "command": "windbg.modules.loadSymbols",
+          "when": "view == windbg.modules && viewItem =~ /^module-(deferred|export|none)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "windbg.modules.symbolInfo",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "inline@2"
+        },
+        {
+          "command": "windbg.modules.loadSymbols",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "1_symbols@1"
+        },
+        {
+          "command": "windbg.modules.symbolInfo",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "1_symbols@2"
+        },
+        {
+          "command": "windbg.modules.copyPath",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "2_copy@1"
+        },
+        {
+          "command": "windbg.modules.copyPdbPath",
+          "when": "view == windbg.modules && viewItem == module-pdb",
+          "group": "2_copy@2"
+        },
+        {
+          "command": "windbg.modules.reveal",
+          "when": "view == windbg.modules && viewItem =~ /^module-/",
+          "group": "3_reveal@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "windbg.viewString",
+          "when": "debugType == 'windbg'"
+        },
+        {
+          "command": "windbg.exceptions.remove",
+          "when": "false"
+        },
+        {
+          "command": "windbg.parallelStacks",
+          "when": "debugType == 'windbg'"
+        },
+        {
+          "command": "windbg.modules.loadSymbols",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.symbolInfo",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.copyPath",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.copyPdbPath",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.reveal",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.sortByName",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.sortByAddress",
+          "when": "false"
+        }
+      ]
+    },
+    "views": {
+      "debug": [
+        {
+          "id": "windbg.exceptions",
+          "name": "WinDbg Exceptions",
+          "contextualTitle": "WinDbg"
+        },
+        {
+          "id": "windbg.modules",
+          "name": "WinDbg Modules",
+          "contextualTitle": "WinDbg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "windbg.exceptions",
+        "contents": "Checked exceptions break when thrown; unchecked ones never do. Others follow the exception filters of the Breakpoints view.\n[Add C++ Exception Type](command:windbg.exceptions.addCpp)\n[Add Win32 Exception](command:windbg.exceptions.addWin32)"
+      },
+      {
+        "view": "windbg.modules",
+        "contents": "Loaded modules (DLLs and EXEs) appear here when a WinDbg debug session is stopped, with their location and whether their PDB is loaded."
+      }
+    ],
+    "configuration": {
+      "title": "WinDbg Debugger",
+      "properties": {
+        "windbg.debuggerPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Path to cdb.exe or its directory. Empty: Windows SDK Debugging Tools, then the WinDbg app, then PATH."
+        },
+        "windbg.symbols.cachePath": {
+          "type": "string",
+          "default": "",
+          "description": "Local cache for downloaded PDBs. Empty: %LOCALAPPDATA%\\vscode-windbg\\SymbolCache."
+        },
+        "windbg.symbols.searchPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Directories searched for PDB files. ${workspaceFolder} is supported."
+        },
+        "windbg.symbols.servers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Symbol server URLs or UNC symbol stores to download PDBs from."
+        },
+        "windbg.symbols.useMicrosoftSymbolServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Download Windows symbols from https://msdl.microsoft.com/download/symbols."
+        },
+        "windbg.symbols.inheritNtSymbolPath": {
+          "type": "boolean",
+          "default": true,
+          "description": "Append the _NT_SYMBOL_PATH environment variable."
+        },
+        "windbg.symbols.verbose": {
+          "type": "boolean",
+          "default": false,
+          "description": "Print symbol loading diagnostics."
+        },
+        "windbg.natvis.files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Natvis files loaded in every session."
+        },
+        "windbg.natvis.loadWorkspaceFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load every *.natvis file found in the workspace folder."
+        },
+        "windbg.justMyCode.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step over external code and collapse it in the call stack."
+        },
+        "windbg.justMyCode.configFile": {
+          "type": "string",
+          "default": "${workspaceFolder}/.vscode/windbg-jmc.json",
+          "description": "Just My Code rules: external/user symbols (namespaces, classes, functions), files and modules, with * wildcards."
+        },
+        "windbg.justMyCode.showExternalCode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show external frames in the call stack instead of [External Code]."
+        },
+        "windbg.console.mode": {
+          "enum": [
+            "commands",
+            "expressions"
+          ],
+          "default": "commands",
+          "enumDescriptions": [
+            "Input is a WinDbg command; 'dx <expr>' evaluates an expandable expression.",
+            "Input is a C++ expression; '-exec <command>' runs a WinDbg command."
+          ],
+          "description": "How the Debug Console interprets input."
+        },
+        "windbg.exceptions.showNotification": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a first-chance exception breaks, offer to stop breaking on that exception type."
+        },
+        "windbg.hexadecimalDisplay": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show integers in hexadecimal."
+        },
+        "windbg.trace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log the communication with cdb to the Debug Console."
+        },
+        "windbg.commandWindow.quickCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "k",
+            "~*k",
+            "dv /t",
+            "r",
+            "lm",
+            "!analyze -v"
+          ],
+          "description": "Buttons on the WinDbg command window toolbar: each one runs its WinDbg command."
+        }
+      }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": [
+          "**/.vscode/windbg-jmc.json",
+          "*.windbg-jmc.json"
+        ],
+        "url": "./schemas/jmc.schema.json"
+      }
+    ],
+    "configurationDefaults": {
+      "files.associations": {
+        "**/.vscode/windbg-jmc.json": "jsonc"
+      }
+    }
+  }
+}
