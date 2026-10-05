@@ -264,8 +264,13 @@ at each stop. For each module:
 
 Actions on a module: **Load Symbols**, **Symbol Load Information** (reloads the module with
 symbol diagnostics on and shows every path tried, like Visual Studio), **Copy Path**, **Copy PDB
-Path** and **Reveal in File Explorer**. The title bar has **Load All Symbols**, **Refresh**, and
-sorting by name or load address. Type in the view to filter it.
+Path** and **Reveal in File Explorer**. The title bar has **Filter**, **Load All Symbols**,
+**Refresh**, and sorting by name or load address.
+
+**Filter** narrows the list as you type: part of a module's name or path (`qt`, `\build\`), or a
+name with `*` and `?` wildcards (`Qt6*`). Several space-separated terms show the modules matching
+any of them. The filter stays across stops and sessions; the title bar shows it with the count of
+matching modules, and **Clear Filter** removes it. Typing in the view still highlights matches.
 
 The same keys are available per configuration under `"symbols": { ... }`. `symbolPath` takes a
 raw dbgeng symbol path. `sourcePaths`, `sourceServer` and `sourceFileMap` control where sources

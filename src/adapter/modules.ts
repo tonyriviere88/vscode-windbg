@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DebugProtocol } from '@vscode/debugprotocol';
+import { hasWildcard, wildcardMatch } from './glob';
 
 /** Module as reported by the data model script. */
 export interface RawModule {
@@ -147,4 +148,20 @@ export function toModule(raw: RawModule, details: ModuleDetails | undefined, pro
         m.dateTimeStamp = details.timestamp;
     }
     return m;
+}
+
+/**
+ * The Modules view filter: space-separated terms, a module showing when one matches. A term is a
+ * case-insensitive part of the file name or path, or with * and ? wildcards the whole file or short name.
+ */
+export function moduleMatchesFilter(m: WinDbgModule, filter: string): boolean {
+    const terms = filter.trim().split(/\s+/).filter((t) => t);
+    if (terms.length === 0) {
+        return true;
+    }
+    const name = m.name.toLowerCase();
+    const full = (m.path ?? '').toLowerCase();
+    return terms.some((t) =>
+        hasWildcard(t) ? wildcardMatch(t, m.name, true) || wildcardMatch(t, m.shortName, true) : name.includes(t.toLowerCase()) || full.includes(t.toLowerCase()),
+    );
 }

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { WinDbgModule } from './adapter/modules';
+import { WinDbgModule, moduleMatchesFilter } from './adapter/modules';
 import { addToAlwaysLoad } from './symbolSettings';
 
 type SortOrder = 'name' | 'address';
@@ -60,6 +60,7 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
     private readonly view: vscode.TreeView<ModuleItem>;
     private modules: WinDbgModule[] = [];
     private sort: SortOrder = 'name';
+    private filter = '';
     private stale = true;
 
     constructor(context: vscode.ExtensionContext) {
@@ -76,6 +77,9 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
             vscode.commands.registerCommand('windbg.modules.refresh', () => this.refresh()),
             vscode.commands.registerCommand('windbg.modules.sortByName', () => this.setSort('name')),
             vscode.commands.registerCommand('windbg.modules.sortByAddress', () => this.setSort('address')),
+            vscode.commands.registerCommand('windbg.modules.filter', () => this.editFilter()),
+            vscode.commands.registerCommand('windbg.modules.editFilter', () => this.editFilter()),
+            vscode.commands.registerCommand('windbg.modules.clearFilter', () => this.setFilter('')),
             vscode.commands.registerCommand('windbg.modules.loadAllSymbols', () => this.loadSymbols(undefined)),
             vscode.commands.registerCommand('windbg.modules.loadSymbols', (item?: ModuleItem) => item && this.loadSymbols(item.module)),
             vscode.commands.registerCommand('windbg.modules.alwaysLoad', (item?: ModuleItem) => item && this.loadSymbols(item.module, true)),
@@ -85,6 +89,7 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
             vscode.commands.registerCommand('windbg.modules.reveal', (item?: ModuleItem) => item?.module.path && vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(item.module.path))),
         );
         void vscode.commands.executeCommand('setContext', 'windbg.modules.sort', this.sort);
+        void vscode.commands.executeCommand('setContext', 'windbg.modules.filtered', false);
     }
 
     /** Called when the target stops: the module list may have changed. */
@@ -111,6 +116,54 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
         this.changed.fire();
     }
 
+    /** Asks for the filter, applying it as it is typed; Escape restores the previous one. */
+    private editFilter(): void {
+        const previous = this.filter;
+        const box = vscode.window.createInputBox();
+        box.title = 'Filter Modules';
+        box.placeholder = 'Part of a name or path, or a wildcard name (Qt6*); several terms show modules matching any';
+        box.value = previous;
+        let accepted = false;
+        box.onDidChangeValue((v) => this.setFilter(v));
+        box.onDidAccept(() => {
+            accepted = true;
+            box.hide();
+        });
+        box.onDidHide(() => {
+            if (!accepted) {
+                this.setFilter(previous);
+            }
+            box.dispose();
+        });
+        box.show();
+    }
+
+    private setFilter(filter: string): void {
+        this.filter = filter.trim();
+        void vscode.commands.executeCommand('setContext', 'windbg.modules.filtered', this.filter !== '');
+        this.describe();
+        this.changed.fire();
+    }
+
+    /** The title bar description: counts, and the filter while one applies. */
+    private describe(): void {
+        if (!session()) {
+            this.view.description = undefined;
+            this.view.message = undefined;
+            return;
+        }
+        const withPdb = this.modules.filter((m) => m.symbolKind === 'pdb').length;
+        const counts = `${this.modules.length} modules, ${withPdb} with PDB`;
+        if (!this.filter) {
+            this.view.description = counts;
+            this.view.message = undefined;
+            return;
+        }
+        const shown = this.modules.filter((m) => moduleMatchesFilter(m, this.filter)).length;
+        this.view.description = `"${this.filter}": ${shown} of ${counts}`;
+        this.view.message = shown === 0 && this.modules.length > 0 ? `No module matches "${this.filter}".` : undefined;
+    }
+
     async refresh(): Promise<void> {
         const s = session();
         this.stale = false;
@@ -130,9 +183,7 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
 
     private update(modules: WinDbgModule[]): void {
         this.modules = modules;
-        const withPdb = modules.filter((m) => m.symbolKind === 'pdb').length;
-        this.view.description = `${modules.length} modules, ${withPdb} with PDB`;
-        this.view.message = undefined;
+        this.describe();
         this.changed.fire();
     }
 
@@ -190,7 +241,7 @@ export class ModulesView implements vscode.TreeDataProvider<ModuleItem> {
         if (element) {
             return [];
         }
-        const list = [...this.modules];
+        const list = this.modules.filter((m) => moduleMatchesFilter(m, this.filter));
         if (this.sort === 'name') {
             list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
         } else {

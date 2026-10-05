@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as path from 'path';
 import { describe, it } from 'node:test';
-import { parseModuleList, resolveImagePath, symbolKind, toModule } from '../../src/adapter/modules';
+import { moduleMatchesFilter, parseModuleList, resolveImagePath, symbolKind, toModule } from '../../src/adapter/modules';
 
 const LMV = `start             end                 module name
 00007ff6\`b0930000 00007ff6\`b094b000   sample   C (private pdb symbols)  d:\\src\\out\\sample.pdb
@@ -54,5 +54,19 @@ describe('modules', () => {
         const e = toModule({ name: 'C:\\w\\ntdll.dll', base: '1000', size: 16, symType: 'Export', symFile: 'C:\\w\\ntdll.dll' }, undefined, undefined, () => false);
         assert.strictEqual(e.symbolFilePath, undefined);
         assert.strictEqual(e.symbolStatus, 'No PDB found (exports only)');
+    });
+
+    it('filters modules by name, path and wildcards', () => {
+        const m = toModule({ name: 'C:\\Qt\\bin\\Qt6Core.dll', base: '1000', size: 16 }, undefined, undefined, () => false);
+        assert.ok(moduleMatchesFilter(m, ''));
+        assert.ok(moduleMatchesFilter(m, '  '));
+        assert.ok(moduleMatchesFilter(m, 'core'));
+        assert.ok(moduleMatchesFilter(m, 'qt\\bin'));
+        assert.ok(moduleMatchesFilter(m, 'ntdll qt6'));
+        assert.ok(moduleMatchesFilter(m, 'qt6*'));
+        assert.ok(moduleMatchesFilter(m, 'qt?core'));
+        assert.ok(!moduleMatchesFilter(m, 'ntdll'));
+        // A wildcard term matches the whole name, not the path.
+        assert.ok(!moduleMatchesFilter(m, 'bin*'));
     });
 });

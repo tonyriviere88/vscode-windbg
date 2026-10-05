@@ -693,6 +693,24 @@
         "icon": "$(list-ordered)"
       },
       {
+        "command": "windbg.modules.filter",
+        "title": "Filter Modules",
+        "category": "WinDbg",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "windbg.modules.editFilter",
+        "title": "Edit Modules Filter",
+        "category": "WinDbg",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "windbg.modules.clearFilter",
+        "title": "Clear Modules Filter",
+        "category": "WinDbg",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "windbg.modules.loadSymbols",
         "title": "Load Symbols",
         "category": "WinDbg",
@@ -810,6 +828,21 @@
           "group": "navigation@3"
         },
         {
+          "command": "windbg.modules.filter",
+          "when": "view == windbg.modules && !windbg.modules.filtered",
+          "group": "navigation@0"
+        },
+        {
+          "command": "windbg.modules.editFilter",
+          "when": "view == windbg.modules && windbg.modules.filtered",
+          "group": "navigation@0"
+        },
+        {
+          "command": "windbg.modules.clearFilter",
+          "when": "view == windbg.modules && windbg.modules.filtered",
+          "group": "navigation@0"
+        },
+        {
           "command": "windbg.modules.refresh",
           "when": "view == windbg.modules",
           "group": "navigation@1"
@@ -913,6 +946,18 @@
         {
           "command": "windbg.modules.sortByName",
           "when": "false"
+        },
+        {
+          "command": "windbg.modules.filter",
+          "when": "debugType == 'windbg'"
+        },
+        {
+          "command": "windbg.modules.editFilter",
+          "when": "false"
+        },
+        {
+          "command": "windbg.modules.clearFilter",
+          "when": "windbg.modules.filtered"
         },
         {
           "command": "windbg.modules.sortByAddress",
