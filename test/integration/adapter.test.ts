@@ -158,6 +158,11 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
             assert.match(find(members, 'wideLabel').value, /L"wide label"/);
             const tags = await s.children(find(members, 'tags'));
             assert.ok(tags.some((v) => v.value.includes('"color", 7')), JSON.stringify(tags));
+            // A nested enum's enumerators and a static constant are no values of the object
+            assert.match(find(members, 'kind').value, /Polygon/);
+            for (const name of ['Polygon', 'Curve', 'MaxPoints']) {
+                assert.ok(!members.some((v) => v.name === name), `${name} listed in [${members.map((v) => v.name).join(', ')}]`);
+            }
         });
 
         it('evaluates watch expressions', async () => {
@@ -332,7 +337,11 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 const tid = (await stopped).body.threadId!;
                 const top = await s.top(tid);
                 const shape = find(await s.locals(top.id), 's');
-                const points = await s.children(find(await s.children(shape), 'points'));
+                // Natvis items named like the members they show are kept, enumerators are not added
+                const shapeItems = await s.children(shape);
+                assert.deepStrictEqual(shapeItems.map((v) => v.name), ['name', 'points', '[area]', '[Raw View]']);
+                assert.strictEqual(find(shapeItems, '[area]').value, '12.5');
+                const points = await s.children(find(shapeItems, 'points'));
                 const p1 = find(points, '[1]');
                 assert.strictEqual(p1.value, '(3, 4)');
                 const items = await s.children(p1);

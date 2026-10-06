@@ -8,4 +8,12 @@
       <Item Name="[length^2]">x * x + y * y</Item>
     </Expand>
   </Type>
+  <!-- No DisplayString, items named like the members they show -->
+  <Type Name="app::Shape">
+    <Expand>
+      <Item Name="name">name</Item>
+      <Item Name="points">points</Item>
+      <Item Name="[area]">area</Item>
+    </Expand>
+  </Type>
 </AutoVisualizer>

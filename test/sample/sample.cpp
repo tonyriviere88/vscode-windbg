@@ -30,6 +30,10 @@ struct Derived : Base {
 };
 
 struct Shape {
+    // Enumerators and constants are listed by the data model like members, but they are not values of the object.
+    enum Kind { Polygon = 1, Curve = 2 };
+    static const int MaxPoints = 64;
+    Kind kind = Polygon;
     std::string name;
     std::vector<Point> points;
     std::map<std::string, int> tags;

@@ -73,7 +73,10 @@ export class WinDbgConfigurationProvider implements vscode.DebugConfigurationPro
             natvis.add(n);
         }
         if (settings.get<boolean>('natvis.loadWorkspaceFiles', true) && folder) {
-            const found = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*.natvis'), '**/node_modules/**', 64);
+            // No result limit: a large repository has more natvis files than any fixed cap, and findFiles returns
+            // them in no particular order, so a cap silently drops whole folders. Sorted for a stable load order.
+            const found = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*.natvis'), '**/node_modules/**');
+            found.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
             for (const f of found) {
                 natvis.add(f.fsPath);
             }

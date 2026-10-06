@@ -661,6 +661,45 @@ function baseClasses(t) {
     return safe(() => Array.from(t.baseClasses), []);
 }
 
+// Field names in the order the data model lists them: own fields first, then each base class.
+function orderedFieldNames(t) {
+    let names = [];
+    let visit = (ty, depth) => {
+        if (!ty || depth > 16) return;
+        let fields = safe(() => ty.fields, undefined);
+        if (fields) for (let n of propNames(fields)) names.push(n);
+        for (let b of baseClasses(ty)) visit(safe(() => b.type, undefined), depth + 1);
+    };
+    visit(t, 0);
+    return names;
+}
+
+// Index of the first raw property in `props`. The data model lists the natvis items first, then
+// ToDisplayString when the visualizer has a DisplayString, then the raw fields mixed with the enumerators
+// of nested enums (which are no fields). A natvis item named like a field replaces that field, so names
+// cannot tell items from fields; the order can.
+function rawTailStart(t, props) {
+    let td = props.indexOf("ToDisplayString");
+    if (td >= 0) return td;
+    let order = orderedFieldNames(t);
+    let rank = new Map();
+    order.forEach((n, i) => { if (!rank.has(n)) rank.set(n, i); });
+    for (let i = 0; i < props.length; i++) {
+        let j = rank.get(props[i]);
+        if (j === undefined) continue;
+        // The raw tail lists the fields in declaration order (a field replaced by an item is listed before it):
+        // no field declared before props[i] may be listed after i, and the next field listed must be the next
+        // declared one still listed after i.
+        if (order.slice(0, j).some((n) => props.indexOf(n, i + 1) > i)) continue;
+        let next = undefined;
+        for (let k = i + 1; k < props.length && next === undefined; k++) if (rank.has(props[k])) next = props[k];
+        let expected = undefined;
+        for (let m = j + 1; m < order.length && expected === undefined; m++) if (props.indexOf(order[m], i + 1) > i) expected = order[m];
+        if (next === expected) return i;
+    }
+    return props.length;
+}
+
 function rawMemberNames(t) {
     let key = typeName(t);
     if (key && rawMemberCache.has(key)) return rawMemberCache.get(key);
@@ -946,8 +985,8 @@ function valueChildren(e, req, opts) {
     let raw = rawMemberNames(t);
     let synthetic = [];
     let visualized = props.indexOf("ToDisplayString") >= 0;
-    for (let name of props) {
-        if (META.has(name) || raw.has(name)) continue;
+    for (let name of props.slice(0, rawTailStart(t, props))) {
+        if (META.has(name)) continue;
         let bracket = name.charAt(0) === "[";
         if (!bracket && /^_[A-Z_]/.test(name)) continue;
         let c;
