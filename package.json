@@ -2,7 +2,7 @@
   "name": "vscode-windbg",
   "displayName": "WinDbg Debugger",
   "description": "Debug native Windows applications (C/C++) in VS Code with the WinDbg engine: Just My Code, natvis, parallel stacks, exception settings and symbol servers.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "vscode",
   "engines": {
     "vscode": "^1.90.0"
