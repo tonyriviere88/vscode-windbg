@@ -1,6 +1,8 @@
 import * as assert from 'assert';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import * as http from 'http';
+import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { after, before, describe, it } from 'node:test';
@@ -214,8 +216,24 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
         it('collapses external frames', async () => {
             const st = await s.dc.stackTraceRequest({ threadId, startFrame: 0, levels: 20 });
             const names = st.body.stackFrames.map((f) => f.name);
-            assert.ok(names.includes('[External Code]'), names.join(', '));
+            // The label names the modules it stands for, in stack order.
+            const label = names.find((n) => n.startsWith('[External Code]'));
+            assert.match(label ?? '', /^\[External Code\] sample, KERNEL32, ntdll$/, names.join(', '));
             assert.ok(!names.some((n) => n.includes('invoke_main')), names.join(', '));
+        });
+
+        it('shows no locals for a frame without symbols', async () => {
+            await s.dc.customRequest('setShowExternalCode', { show: true });
+            try {
+                const st = await s.dc.stackTraceRequest({ threadId, startFrame: 0, levels: 20 });
+                const k32 = st.body.stackFrames.find((f) => /^KERNEL32\+/i.test(f.name));
+                assert.ok(k32, st.body.stackFrames.map((f) => f.name).join(', '));
+                const scopes = await s.dc.scopesRequest({ frameId: k32!.id });
+                const vars = await s.dc.variablesRequest({ variablesReference: scopes.body.scopes[0].variablesReference });
+                assert.deepStrictEqual(vars.body.variables, []);
+            } finally {
+                await s.dc.customRequest('setShowExternalCode', { show: false });
+            }
         });
 
         it('sets variables', async () => {
@@ -240,6 +258,21 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
             const dis = await s.dc.disassembleRequest({ memoryReference: top.instructionPointerReference!, instructionOffset: -4, instructionCount: 10 });
             assert.strictEqual(dis.body!.instructions.length, 10);
             assert.ok(dis.body!.instructions.some((i) => BigInt(i.address) === BigInt(top.instructionPointerReference!)));
+        });
+
+        it('shows the bytes of code whose symbols are deferred instead of loading them', async () => {
+            const mods = async () => (await s.dc.customRequest('modules', {})).body.modules as Array<{ shortName: string; symbolKind: string; baseAddress: string }>;
+            const deferred = (await mods()).find((m) => m.symbolKind === 'deferred');
+            assert.ok(deferred, 'no module with deferred symbols');
+            const code = `0x${(BigInt('0x' + deferred!.baseAddress) + 0x1000n).toString(16)}`;
+            const dis = await s.dc.disassembleRequest({ memoryReference: code, instructionOffset: -2, instructionCount: 6 });
+            const ins = dis.body!.instructions;
+            assert.strictEqual(ins.length, 6);
+            assert.ok(ins.every((i) => i.instruction.startsWith('db ')), JSON.stringify(ins));
+            assert.strictEqual(BigInt(ins[2].address), BigInt(code));
+            assert.match(ins[0].symbol ?? '', /symbols not loaded/);
+            const after = (await mods()).find((m) => m.shortName === deferred!.shortName)!;
+            assert.strictEqual(after.symbolKind, 'deferred', `disassembling ${deferred!.shortName} loaded its symbols`);
         });
 
         it('lists modules with their location and symbol state', async () => {
@@ -365,6 +398,47 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
             }
         });
 
+        it('never loads symbols for a natvis naming another module, and uses it once they are loaded', async () => {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'windbg-natvis-'));
+            const file = path.join(dir, 'cross.natvis');
+            fs.writeFileSync(
+                file,
+                `<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+  <Type Name="app::Point">
+    <DisplayString Condition="((plugin.dll!app::Base*)0) == 0">P({x}, {y})</DisplayString>
+    <DisplayString>({x}, {y})</DisplayString>
+  </Type>
+</AutoVisualizer>`,
+            );
+            const s = new Session();
+            try {
+                const stopped = s.waitStopped();
+                // plugin.dll must stay deferred: its PDB is next to it.
+                await s.start({ natvis: [file], symbols: { ...baseLaunch.symbols, autoLoadExclude: ['plug*'] } }, async () => {
+                    await s.setLines([lineOf('return total;')]);
+                });
+                const tid = (await stopped).body.threadId!;
+                const p1 = async () => {
+                    const top = await s.top(tid);
+                    return find(await s.children(find(await s.children(find(await s.locals(top.id), 's')), 'points')), '[1]').value;
+                };
+                const plugin = async () =>
+                    (await s.dc.customRequest('modules', {})).body.modules.find((m: { shortName: string }) => m.shortName.toLowerCase() === 'plugin').symbolKind;
+                assert.strictEqual(await p1(), '(3, 4)');
+                assert.strictEqual(await plugin(), 'deferred', 'the natvis loaded the plugin symbols');
+
+                const invalidated = s.dc.waitForEvent('invalidated', TIMEOUT);
+                await s.dc.customRequest('loadSymbols', { module: 'plugin' });
+                await invalidated;
+                assert.strictEqual(await plugin(), 'pdb');
+                assert.strictEqual(await p1(), 'P(3, 4)');
+            } finally {
+                await s.stop();
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        });
+
         it('reloads a natvis file edited while stopped', async () => {
             const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'windbg-natvis-'));
             const file = path.join(dir, 'sample.natvis');
@@ -432,23 +506,22 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 assert.strictEqual((await watch('$tid')).body.result, String(tid));
                 assert.match((await watch('$err')).body.result, /^\d+$/);
                 await assert.rejects(watch('$nosuch'), /not a register or a pseudo-variable/);
-                // Another module's global: Visual Studio's context operator. Without the Microsoft
-                // symbol server, ucrtbased has export symbols only and the error says so.
+                // Another module's global: Visual Studio's context operator. A watch loads no symbols:
+                // ucrtbased's are deferred, and the error says so.
                 const crt = s.dc.evaluateRequest({ expression: '{,,ucrtbased.dll}_crtBreakAlloc', frameId: top.id, context: 'watch' });
-                await crt.then(
-                    (r) => assert.match(r.body.result, /^-?\d+$/),
-                    (e: Error) => assert.match(e.message, /ucrtbased has export symbols only/),
-                );
+                await assert.rejects(crt, /Symbols for ucrtbased are not loaded/);
+                const module = async (name: string) => {
+                    const res = await s.dc.customRequest('modules', {});
+                    return (res.body.modules as Array<{ shortName: string; symbolKind: string }>).find((m) => m.shortName.toLowerCase() === name)!;
+                };
+                assert.strictEqual((await module('ucrtbased')).symbolKind, 'deferred', 'a watch loaded ucrtbased');
 
                 // In main: a pointer to an object whose dynamic type only plugin.dll's symbols describe.
                 await s.setLines([lineOf('// plugin object')]);
                 await s.run(() => s.dc.continueRequest({ threadId: tid }));
                 top = await s.top(tid);
                 assert.strictEqual(top.line, lineOf('// plugin object'));
-                const plugin = async () => {
-                    const res = await s.dc.customRequest('modules', {});
-                    return (res.body.modules as Array<{ shortName: string; symbolKind: string }>).find((m) => m.shortName.toLowerCase() === 'plugin')!;
-                };
+                const plugin = () => module('plugin');
                 assert.strictEqual((await plugin()).symbolKind, 'deferred');
                 const need = s.dc.waitForEvent('windbgNeedSymbols', TIMEOUT);
                 const plugged = await hover('plugged');
@@ -457,11 +530,22 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 assert.deepStrictEqual(ev.body.modules, [{ module: 'plugin', type: 'app::PluginShape' }]);
                 assert.strictEqual((await plugin()).symbolKind, 'deferred', 'the hover loaded the plugin symbols');
 
-                // A watch may load them, and then shows the dynamic type.
-                assert.match((await watch('plugged')).body.result, /sides=5/);
+                // A watch does not load them either, whatever names the module: only an explicit load does.
+                assert.match((await watch('plugged')).body.result, /baseValue=11/);
+                await assert.rejects(watch('plugin!app::pluginCounter * 2'), /Symbols for plugin are not loaded/);
+                await assert.rejects(watch('{,,plugin.dll}app::pluginCounter'), /Symbols for plugin are not loaded/);
+                await assert.rejects(watch('(plugin.dll!app::PluginShape*)plugged'), /Symbols for plugin are not loaded/);
+                assert.strictEqual((await plugin()).symbolKind, 'deferred', 'a watch loaded the plugin symbols');
+
+                // Once loaded, the views are refreshed and the watch shows the dynamic type.
+                const refreshed = s.dc.waitForEvent('invalidated', TIMEOUT);
+                await s.dc.customRequest('loadSymbols', { module: 'plugin' });
+                assert.ok(((await refreshed).body.areas ?? []).includes('variables'));
                 assert.strictEqual((await plugin()).symbolKind, 'pdb');
+                assert.match((await watch('plugged')).body.result, /sides=5/);
                 assert.strictEqual((await watch('{,,plugin.dll}app::pluginCounter')).body.result, '7');
                 assert.strictEqual((await watch('plugin!app::pluginCounter * 2')).body.result, '14');
+                assert.strictEqual((await watch('plugin.dll!app::pluginCounter')).body.result, '7');
             } finally {
                 await s.stop();
             }
@@ -478,8 +562,9 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
                 const tid = (await stopped).body.threadId!;
                 const top = await s.top(tid);
                 const started = Date.now();
-                await assert.rejects(s.dc.evaluateRequest({ expression: '*this', frameId: top.id, context: 'watch' }), /Stopped after 2 s/);
-                assert.ok(Date.now() - started < 15000, `took ${Date.now() - started} ms`);
+                await assert.rejects(s.dc.evaluateRequest({ expression: '*this', frameId: top.id, context: 'watch' }), /No answer after 2 s/);
+                // Answered at the deadline, without waiting for cdb to give up.
+                assert.ok(Date.now() - started < 4000, `took ${Date.now() - started} ms`);
                 // cdb is usable again at once.
                 assert.strictEqual((await s.dc.evaluateRequest({ expression: 'count', frameId: top.id, context: 'watch' })).body.result, '3');
                 // The target shares cdb's console and got the Ctrl+Break too: it must run on to its normal exit.
@@ -517,6 +602,49 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
             } finally {
                 await s.stop();
             }
+        });
+
+        describe('code whose symbols are deferred', () => {
+            // plugin.dll keeps its symbols deferred: its PDB is next to it.
+            const deferredPlugin = { symbols: { ...baseLaunch.symbols, autoLoadExclude: ['plug*'] } };
+            const pluginSymbols = async (s: Session) =>
+                (await s.dc.customRequest('modules', {})).body.modules.find((m: { shortName: string }) => m.shortName.toLowerCase() === 'plugin').symbolKind;
+
+            it('is external with Just My Code: Step Into steps over a call into it, loading nothing', async () => {
+                const s = new Session();
+                try {
+                    const stopped = s.waitStopped();
+                    await s.start(deferredPlugin, async () => {
+                        await s.setLines([lineOf('app::Base* plugged = makePluginObject();')]);
+                    });
+                    const tid = (await stopped).body.threadId!;
+                    await s.setLines([]);
+                    await s.run(() => s.dc.stepInRequest({ threadId: tid }));
+                    const top = await s.top(tid);
+                    assert.match(top.name, /!main/, `stepped into ${top.name}`);
+                    assert.strictEqual(top.line, lineOf('// plugin object'));
+                    assert.strictEqual(await pluginSymbols(s), 'deferred', 'stepping loaded the plugin symbols');
+                } finally {
+                    await s.stop();
+                }
+            });
+
+            it('is stepped into without Just My Code', async () => {
+                const s = new Session();
+                try {
+                    const stopped = s.waitStopped();
+                    await s.start({ ...deferredPlugin, justMyCode: false }, async () => {
+                        await s.setLines([lineOf('app::Base* plugged = makePluginObject();')]);
+                    });
+                    const tid = (await stopped).body.threadId!;
+                    await s.setLines([]);
+                    await s.run(() => s.dc.stepInRequest({ threadId: tid }));
+                    const top = await s.top(tid);
+                    assert.match(top.name, /plugin!/, `stepped into ${top.name}`);
+                } finally {
+                    await s.stop();
+                }
+            });
         });
 
         it('treats symbols listed in the config file as external', async () => {
@@ -578,6 +706,39 @@ describe('WinDbg adapter', { timeout: 10 * TIMEOUT }, () => {
 
     describe('symbol loading and breakpoints', () => {
         const fileLine = (file: string, text: string) => fs.readFileSync(file, 'utf8').split(/\r?\n/).findIndex((l) => l.includes(text)) + 1;
+
+        it('never asks a symbol server of _NT_SYMBOL_PATH while starting and stopping', async () => {
+            const requests: string[] = [];
+            const server = http.createServer((req, res) => {
+                requests.push(req.url ?? '');
+                res.writeHead(404).end();
+            });
+            await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+            const port = (server.address() as AddressInfo).port;
+            const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'windbg-nocache-'));
+            const saved = process.env._NT_SYMBOL_PATH;
+            // The adapter, and so cdb, inherits it when the session starts.
+            process.env._NT_SYMBOL_PATH = `srv*${cache}*http://127.0.0.1:${port}/symbols`;
+            const s = new Session();
+            try {
+                const stopped = s.waitStopped();
+                await s.start({ symbols: { ...baseLaunch.symbols, inheritNtSymbolPath: true } }, async () => {
+                    await s.setLines([lineOf('return total;')]);
+                });
+                const ev = await stopped;
+                await s.dc.stackTraceRequest({ threadId: ev.body.threadId!, startFrame: 0, levels: 20 });
+                assert.deepStrictEqual(requests, []);
+            } finally {
+                await s.stop();
+                if (saved === undefined) {
+                    delete process.env._NT_SYMBOL_PATH;
+                } else {
+                    process.env._NT_SYMBOL_PATH = saved;
+                }
+                server.close();
+                fs.rmSync(cache, { recursive: true, force: true });
+            }
+        });
 
         it('binds a breakpoint in a DLL loaded later through its local PDB', async () => {
             const s = new Session();

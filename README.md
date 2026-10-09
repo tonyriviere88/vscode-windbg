@@ -59,7 +59,8 @@ With `justMyCode` on (the default):
   continues into the next user call on the same line.
 - **Step over / step out** that would land in external code keep running until user code is
   reached.
-- External frames collapse into **[External Code]** in the Call Stack. Toggle them with
+- External frames collapse into **[External Code]** in the Call Stack, followed by the modules
+  they belong to (`[External Code] Qt6Core, Qt6Widgets +2`). Toggle them with
   **Show External Code** / **Hide External Code** in the Call Stack context menu.
 
 Code is external when its function, source file or module matches a rule in the configuration
@@ -104,17 +105,23 @@ automatically.
 - Registers: `rdi`, `$rdi` or `@rdi` (sub-registers too: `edi`, `dil`), so `(char*)rdi,sz` works.
   Visual Studio's pseudo-variables `$tid`, `$pid` and `$err` (last error) are available. A hover
   only takes the `$`/`@` forms. Values come from the stopped thread.
-- An evaluation still running after `evaluationTimeout` seconds (default 10) is interrupted and
-  shown as an error, so a slow natvis or symbol lookup never blocks the debugger.
+- Anything VS Code waits for (an evaluation, the Variables view, call stacks, threads, modules,
+  disassembly, memory, the analysis of a stop) is answered within `evaluationTimeout` seconds
+  (default 10). Past that, the request fails with an error saying what cdb is busy with, without
+  waiting for cdb, and the command still running is interrupted. Symbol loads you ask for have no
+  limit: a download can take longer.
 - Names are looked up the way Visual Studio does, without leaving the frame's module: locals
   and parameters, members of `this` (so hovering `m_value` in a method works), the enclosing
   classes and namespaces, then the module's globals. `module!name` or Visual Studio's
   `{,,module.dll}name` reaches another module. A name found nowhere is reported as undefined at
   once; only the Debug Console falls back to cdb's search of every module, which can take minutes
   in a large process.
-- **A hover never loads symbols.** It does not call functions or change values either. When the
-  value's dynamic type, or a `module!name`, needs a module whose symbols are not loaded yet, the
-  hover shows what it can and a notification offers **Load Symbols** for that module.
+- **Showing a value never loads symbols**: hover, Watch, Variables view, Debug Console
+  expressions and logpoints alike. When the value's dynamic type, a `module!name`,
+  `module.dll!name` or `{,,module.dll}name` (a cast included) needs a module whose symbols are not
+  loaded yet, the view shows what it can, or "Symbols for *module* are not loaded", and a
+  notification offers **Load Symbols** for that module. A hover does not call functions or change
+  values either.
 - **Set Value**, **Copy Value**, **Add to Watch**, **View Binary Data** (memory view) and
   **Break on Value Change** (data breakpoints) work in the Variables view.
 - **View String** (Variables/Watch context menu) opens the full content of a `char*`,
@@ -133,6 +140,13 @@ from:
 An edited natvis file is reloaded during the session: at once while the target is stopped (the
 Variables and Watch views refresh), at the next stop while it runs. The list of files is set when the
 session starts, so a natvis file added later needs a restart.
+
+A visualizer naming another module (`RshGeometry.dll!rsh::GCloud`) would make cdb load that
+module's symbols to show a value. While they are not loaded, cdb gets a copy of the natvis file
+in which that module is renamed to one that does not exist: the expression fails at once and the
+visualizer falls back to its next `DisplayString`, or to the raw value. Once the module's symbols
+are loaded (startup autoload, **Load Symbols**...), the file is loaded again unchanged and the
+views refresh.
 
 Visualized objects keep a **[Raw View]** child.
 
@@ -229,16 +243,33 @@ to running sessions.
 In a launch configuration the same options go under `"symbols"`: `autoLoadLocal`,
 `autoLoadInclude`, `autoLoadExclude`, `alwaysLoad`.
 
-**A stop loads no symbols.** The engine's own stack walk loads the symbols of every module on
-the stack, so the extension walks stacks itself, from the unwind data of the images (x64), and
-names frames only from symbols already loaded: a frame in a module without them shows as
-`module+0x…`. Locals and expressions of any frame are read the same way. Two differences with the
-engine's walk: inline frames are not shown, and in optimized code a caller's local kept in rbx,
-rsi, rdi or r12-r15 can show the callee's value.
+**Symbols load on startup and on request only.** What loads them:
+
+- `windbg.symbols.autoLoadLocal` (the PDB next to a module, when the module loads) and
+  `windbg.symbols.alwaysLoad`;
+- **Load Symbols**, **Load All Symbols**, **Always Load Symbols**, **Symbol Load Information**,
+  **WinDbg: Reload Symbols**, and the commands you type in the Debug Console;
+- cdb itself, at a stop: it loads the symbols of the module it stopped in and of its caller's,
+  whatever stopped it. They are searched for locally only (see below).
+
+Nothing else does: not the call stacks, the Variables and Watch views, hovers, natvis (see
+[Natvis](#natvis)), breakpoints or the Disassembly view, which shows the bytes of code whose
+symbols are not loaded. With Just My Code, **Step Into** treats code whose symbols are not loaded
+as external and steps over the calls into it, so that it never stops there; without Just My
+Code it steps in, and cdb loads them.
+
+The extension walks stacks itself, from the unwind data of the images (x64), because the
+engine's walk loads the symbols of every module on the stack. Frames are named from symbols
+already loaded: a frame in a module without them shows as `module+0x…`. Locals and expressions of
+any frame are read the same way. Two differences with the engine's walk: inline frames are not
+shown, and in optimized code a caller's local kept in rbx, rsi, rdi or r12-r15 can show the
+callee's value.
 
 **Symbol servers are only used on request.** The symbol path in use holds only local locations:
-folders, and your symbol cache (`srv*<cache>`), which keeps every PDB downloaded before.
-Servers (and UNC symbol stores and folders) are searched only by:
+folders, and your symbol cache (`srv*<cache>`), which keeps every PDB downloaded before. This
+holds from the moment cdb starts: `_NT_SYMBOL_PATH` is not used as the target starts either.
+Servers, and symbol stores or folders on a share (UNC paths and mapped network drives such as
+`H:\SymbolServer`), are searched only by:
 
 - **Load Symbols** on a stack frame (Call Stack view) or a module (Modules view), **Load All
   Symbols**, **Symbol Load Information**, and the hover's "Load Symbols" offer;
@@ -249,6 +280,10 @@ Servers (and UNC symbol stores and folders) are searched only by:
 - the modules in `windbg.symbols.alwaysLoad`. `["*"]` loads everything as it loads.
 
 Commands typed in the Debug Console (`ld`, `.reload /f`) use the local path.
+
+The PDB path a module was built with (often a build server share) is ignored
+(`SYMOPT_IGNORE_CVREC`), except by the explicit loads above, and only when it is local. A module
+loaded from a share is never checked for a PDB next to it at load time.
 
 A stop that is never shown (an exception that does not break, a hit count not reached, a
 logpoint without `$FUNCTION`, `$CALLER`, `$CALLSTACK`, `$ADDRESS` or `$FILEPOS`) does not walk the

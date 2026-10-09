@@ -839,6 +839,10 @@ function makeVar(parent, name, v, hint, evalName, opts) {
 function localsOf(e, opts) {
     ensureContext(e.tid, e.fi);
     let out = [];
+    // A frame without private symbols (no source line) has none: dbgeng's scope would still be the
+    // one of the last frame that had them, whose locals `x` would list.
+    let frame = safe(() => frameInfo(frameContext(num(findThread(e.tid).Id), e.fi || 0), e.fi || 0), undefined);
+    if (!frame || !frame.file) return out;
     for (let name of scopeNames()) {
         if (name.charAt(0) === "<") continue;
         let v;
@@ -1088,8 +1092,10 @@ function withoutLoads(f) {
     symbolHints = [];
     let before = noLoadModules.filter(m => m.deferred).map(m => m.name);
     let finish = (r) => {
-        if (symbolHints.length > 0) r.needSymbols = symbolHints;
         let after = new Set(readModules().filter(m => m.deferred).map(m => m.name));
+        // Only the modules still deferred: dbgeng may have loaded one meanwhile.
+        let needed = symbolHints.filter(h => after.has(h.module));
+        if (needed.length > 0) r.needSymbols = needed;
         let loaded = before.filter(n => !after.has(n));
         if (loaded.length > 0) r.loadedSymbols = loaded;
         return r;
@@ -1104,6 +1110,35 @@ function withoutLoads(f) {
         noLoad = prevNoLoad;
         noLoadModules = prevModules;
         symbolHints = prevHints;
+    }
+}
+
+// withoutLoads for a call whose caller only knows success or failure.
+function noLoads(f) {
+    let r = withoutLoads(f);
+    if (r && r.failed !== undefined) throw new Error(r.failed);
+    return r;
+}
+
+// "module!name", "module.dll!Type" (a cast included) or "{,,module.dll}name": dbgeng loads the
+// symbols of that module to evaluate it. With symbol loading forbidden, a module whose symbols are
+// deferred fails the expression before dbgeng sees it.
+const MODULE_QUALIFIER = /([A-Za-z_]\w*)(?:\.(?:dll|exe))?!(?=[A-Za-z_:~])/gi;
+
+function checkModuleNames(expr) {
+    if (!noLoad) return;
+    let text = expr.replace(VS_CONTEXT, (m, mod) => moduleBaseName(mod.trim().replace(/^"|"$/g, "")) + "!");
+    // String and character literals hold no names.
+    text = text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""');
+    let table = moduleTable();
+    let m;
+    MODULE_QUALIFIER.lastIndex = 0;
+    while ((m = MODULE_QUALIFIER.exec(text)) !== null) {
+        let mod = moduleNamed(table, m[1]);
+        if (mod && mod.deferred) {
+            addSymbolHint({ module: mod.name });
+            throw new Error("Symbols for " + mod.name + " are not loaded");
+        }
     }
 }
 
@@ -1176,6 +1211,7 @@ const TWO_CHAR_OPS = ["::", "->", "++", "--", "==", "!=", "<=", ">=", "&&", "||"
 // Data model syntax (LINQ lambdas, @$ variables, the Debugger namespace) is passed through.
 const DATA_MODEL_SYNTAX = /@\$|=>|^\s*Debugger\./;
 const VS_CONTEXT = /\{\s*[^{},]*,\s*[^{},]*,\s*([^{},]+?)\s*\}\s*/g;
+const MODULE_FILE_QUALIFIER = /\b([A-Za-z_]\w*)\.(?:dll|exe)!(?=[A-Za-z_:~])/gi;
 
 // Splits an expression into identifier ("id"), number, string, register ("reg") and operator
 // tokens with their positions.
@@ -1268,6 +1304,8 @@ function isTypePosition(toks, i, end) {
 function rewriteNames(expr, lookup) {
     if (DATA_MODEL_SYNTAX.test(expr)) return { expr: expr };
     expr = expr.replace(VS_CONTEXT, (m, mod) => moduleBaseName(mod.trim().replace(/^"|"$/g, "")) + "!");
+    // Visual Studio's "module.dll!name": dbgeng names the module without its extension.
+    expr = expr.replace(MODULE_FILE_QUALIFIER, "$1!");
     let toks = scanTokens(expr);
     let out = "";
     let pos = 0;
@@ -1313,7 +1351,8 @@ function rewriteNames(expr, lookup) {
         let prev = toks[first - 1];
         let memberAccess = prev && (prev.s === "." || prev.s === "->" || prev.s === "::");
         if (memberAccess || castDepth > 0) continue;
-        if (!module && (CPP_KEYWORDS.has(parts[0]) || isTypePosition(toks, first, i))) continue;
+        // A type, module-qualified ones included ("(plugin!app::Shape*)p"), is dbgeng's to resolve.
+        if ((!module && CPP_KEYWORDS.has(parts[0])) || isTypePosition(toks, first, i)) continue;
         let r = lookup(parts, toks[i + 1], module);
         if (!r) continue;
         out += expr.slice(pos, toks[first].start) + r.text;
@@ -1568,6 +1607,7 @@ function parseFormat(expr) {
 function evaluateValue(text, opts) {
     let f = parseFormat(text);
     let expr = f.expr;
+    checkModuleNames(expr);
     let hex = opts.hex;
     let raw = false;
     if (f.spec === "x" || f.spec === "X" || f.spec === "h") hex = true;
@@ -1723,10 +1763,12 @@ const MODULE_SLOT = "@@MODULE@@";
 // Symbol loading at module load: `local` loads the PDB next to the image (modules passing
 // include/exclude), `always` the modules matching it from the whole symbol path.
 let autoLoad = { local: false, include: [], exclude: [], always: [], program: undefined };
-// The symbol path in use is `localPath`: nothing reached over the network, so that a stack walk,
-// which makes dbgeng load the symbols of every module on the stack, never waits on a server.
-// `fullPath`, with the symbol servers, is only used by explicit loads (withFullPath).
+// The symbol path in use is `localPath`: nothing reached over the network, so that what dbgeng
+// loads on its own (the module a stop is in) never waits on a server. `fullPath`, with the symbol
+// servers, is only used by explicit loads (withFullPath).
 let symbolPaths = { localPath: "", fullPath: "" };
+// Drive letters (upper case) mapped to network shares.
+let networkDrives = new Set();
 // Printed while the target runs, when a module load bound a pending breakpoint.
 const MARK_BOUND = "@@WDBGBOUND@@";
 
@@ -1808,12 +1850,17 @@ function changeSymbolPath(p, keep) {
     }
 }
 
-// Runs f with the symbol servers in the symbol path. What f downloads lands in the cache, where
-// the local path finds it again.
-function withFullPath(f) {
-    if (symbolPaths.fullPath === symbolPaths.localPath) return f();
+// Runs f with the symbol servers in the symbol path, after `folders` (the local folders the PDBs
+// were built in). What f downloads lands in the cache, where the local path finds it again.
+function withFullPath(f, folders) {
+    let extra = [];
+    for (let d of folders || []) {
+        if (d && !extra.some(x => x.toLowerCase() === d.toLowerCase())) extra.push(d);
+    }
+    let full = extra.concat(symbolPaths.fullPath ? [symbolPaths.fullPath] : []).join(";");
+    if (full === symbolPaths.localPath) return f();
     let before = loadedPdbNames();
-    setSymbolPath(symbolPaths.fullPath);
+    setSymbolPath(full);
     try {
         return f();
     } finally {
@@ -1826,7 +1873,7 @@ function withFullPath(f) {
 function loadAtModuleLoad(image, name, base) {
     if (autoLoadWanted(name) && loadLocalPdb(image, name, base)) return true;
     if (!alwaysLoadWanted(name)) return false;
-    withFullPath(() => commandLines("ld " + name));
+    withFullPath(() => commandLines("ld " + name), [buildPdbFolder(base)]);
     return true;
 }
 
@@ -1840,7 +1887,8 @@ function targetBytes(addr, count) {
     return out;
 }
 
-// The PDB identity an image was linked with (its CodeView RSDS record): { guid, age }, or null.
+// The PDB identity an image was linked with (its CodeView RSDS record): { guid, age, path }, or
+// null. path is the PDB the linker wrote, as it named it.
 function imageCodeView(base) {
     let opt = base + read32(base + 0x3c) + 24;
     let pe64 = num(host.memory.readMemoryValues(opt, 1, 2)[0]) === 0x20b;
@@ -1852,9 +1900,44 @@ function imageCodeView(base) {
         let data = u32(entry, 20);
         if (u32(entry, 12) !== 2 || !data) continue;
         let cv = targetBytes(base + data, 24);
-        if (u32(cv, 0) === 0x53445352) return { guid: cv.slice(4, 20), age: u32(cv, 20) };
+        if (u32(cv, 0) === 0x53445352) return { guid: cv.slice(4, 20), age: u32(cv, 20), path: safe(() => cvPath(base + data + 24), "") };
     }
     return null;
+}
+
+// The null-terminated UTF-8 path at addr.
+function cvPath(addr) {
+    let bytes = [];
+    for (let b of targetBytes(addr, 520)) {
+        if (b === 0) break;
+        bytes.push(b);
+    }
+    let pct = bytes.map(b => "%" + ("0" + b.toString(16)).slice(-2)).join("");
+    return safe(() => decodeURIComponent(pct), String.fromCharCode.apply(null, bytes));
+}
+
+// A location reached over the network: a UNC path or a mapped network drive.
+function isRemoteLocation(p) {
+    if (/^(\\\\|\/\/)/.test(p)) return true;
+    let d = /^([A-Za-z]):/.exec(p);
+    return !!d && networkDrives.has(d[1].toUpperCase());
+}
+
+// The folder of the PDB the module at base was built with, when it is local; undefined otherwise.
+// dbgeng ignores that path (SYMOPT_IGNORE_CVREC), so that what it loads on its own never waits on a
+// build server share: explicit loads put the local folder in the symbol path instead. Changing the
+// option per load is no way out: any .symopt change makes dbgeng drop the PDBs loaded from folders.
+function buildPdbFolder(base) {
+    let cv = base === undefined ? null : safe(() => imageCodeView(base), null);
+    if (!cv || !cv.path) return undefined;
+    let dir = cv.path.replace(/[\\/][^\\/]*$/, "");
+    return dir && dir !== cv.path && !isRemoteLocation(dir) ? dir : undefined;
+}
+
+// Loads symbols on request: req.command for req.module, or for every deferred module when it is "*".
+function explicitLoad(req) {
+    let targets = readModules().filter(m => req.module === "*" ? m.deferred : m.name.toLowerCase() === moduleBaseName(req.module).toLowerCase());
+    return withFullPath(() => commandLines(req.command).join("\n"), targets.map(m => buildPdbFolder(m.base)));
 }
 
 // The identity of a PDB file (MSF 7.00): the GUID of its PDB stream and the ages of its PDB and
@@ -1918,19 +2001,15 @@ function pdbMatches(base, pdb) {
     return !!id && id.guid.every((b, i) => b === cv.guid[i]) && id.ages.indexOf(cv.age) >= 0;
 }
 
-// Loads the PDB next to the image when it is the image's own; true when it was loaded.
+// Loads the PDB next to the image when it is the image's own; true when it was loaded. An image on
+// a share is left alone: looking at its folder would wait on the network at every module load.
 function loadLocalPdb(image, name, base) {
     let dir = image.replace(/[\\/][^\\/]*$/, "");
     let pdb = image.replace(/\.[^.\\/]*$/, "") + ".pdb";
-    if (dir === image || !safe(() => host.namespace.Debugger.Utility.FileSystem.FileExists(pdb), false) || !pdbMatches(base, pdb)) return false;
-    // dbgeng looks next to the image only after the whole symbol path: the folder goes first, so
-    // the matching PDB is the first thing found. Once per folder: a change of the symbol path
-    // makes dbgeng try again the modules it found no PDB for.
-    if (!symbolPaths.localPath.split(";").some(p => p.trim().toLowerCase() === dir.toLowerCase())) {
-        let prepend = p => p ? dir + ";" + p : dir;
-        symbolPaths = { localPath: prepend(symbolPaths.localPath), fullPath: prepend(symbolPaths.fullPath) };
-        changeSymbolPath(symbolPaths.localPath, loadedPdbNames());
-    }
+    if (dir === image || isRemoteLocation(image)) return false;
+    if (!safe(() => host.namespace.Debugger.Utility.FileSystem.FileExists(pdb), false) || !pdbMatches(base, pdb)) return false;
+    // dbgeng finds it next to the image once the (local) symbol path is searched. The symbol path
+    // is left alone: any change of it makes dbgeng drop the symbols it got from the symbol cache.
     commandLines("ld " + name);
     return true;
 }
@@ -1954,6 +2033,184 @@ function onModuleLoad() {
     } catch (e) {
         // A failed load leaves the module deferred.
     }
+}
+
+// ------------------------------------------------------------------ steps
+//
+// dbgeng loads the symbols of the module it stops in, and of the caller's, whatever stopped it.
+// With Just My Code, Step Into must therefore never stop in code whose symbols are deferred: a call
+// into it is stepped over, as external code (Visual Studio does the same with "load only specified
+// modules"). The decision needs the calls of the current line and their targets, read here without
+// loading anything.
+
+const MAX_LINE_INSTRUCTIONS = 4000;
+
+function disassemblerOf() {
+    if (!disassembler) disassembler = host.namespace.Debugger.Utility.Code.CreateDisassembler();
+    return disassembler;
+}
+
+// The instruction at addr, in code whose symbols are loaded (dbgeng names its operands).
+function instructionAt(addr) {
+    for (let ins of disassemblerOf().DisassembleInstructions(addr)) return instructionInfo(ins);
+    return null;
+}
+
+function instructionInfo(ins) {
+    let a = ins.Attributes;
+    let bytes = [];
+    for (let b of ins.CodeBytes) bytes.push(num(b));
+    let si = safe(() => ins.SourceInformation, undefined);
+    return {
+        addr: num(ins.Address),
+        len: num(ins.Length),
+        bytes: bytes,
+        isCall: !!safe(() => a.IsCall, false),
+        isRet: !!safe(() => a.IsReturn, false),
+        isBranch: !!safe(() => a.IsBranch, false),
+        isConditional: !!safe(() => a.IsConditional, false),
+        line: si ? safe(() => si.SourceLine === undefined ? undefined : num(si.SourceLine), undefined) : undefined,
+        fn: si ? safe(() => si.FunctionAddress === undefined ? undefined : num(si.FunctionAddress), undefined) : undefined
+    };
+}
+
+// The opcode position after the legacy and REX prefixes, and the REX byte (0 when none).
+function opcodeStart(b) {
+    let i = 0;
+    let rex = 0;
+    while (i < b.length && [0x66, 0x67, 0xf2, 0xf3, 0x2e, 0x3e].indexOf(b[i]) >= 0) i++;
+    if (i < b.length && b[i] >= 0x40 && b[i] <= 0x4f) rex = b[i++];
+    return { i: i, rex: rex };
+}
+
+function rel32(b, at) {
+    return u32(b, at) | 0;
+}
+
+function signed8(v) {
+    return v > 127 ? v - 256 : v;
+}
+
+// The target of a direct call or jump (E8, E9, EB, Jcc, LOOP/JRCXZ), or undefined.
+function directTarget(ins) {
+    let b = ins.bytes;
+    let o = opcodeStart(b);
+    let op = b[o.i];
+    let next = ins.addr + ins.len;
+    if (op === 0xe8 || op === 0xe9) return next + rel32(b, o.i + 1);
+    if (op === 0xeb || (op >= 0x70 && op <= 0x7f) || (op >= 0xe0 && op <= 0xe3)) return next + signed8(b[o.i + 1]);
+    if (op === 0x0f && b[o.i + 1] >= 0x80 && b[o.i + 1] <= 0x8f) return next + rel32(b, o.i + 2);
+    return undefined;
+}
+
+const REGISTERS_BY_NUMBER = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+
+// The target of a call (direct, or FF /2 through a register or memory, computed with the thread's
+// registers when `regs` is given; undefined when it depends on them and they are not).
+function callTarget(ins, regs) {
+    let direct = directTarget(ins);
+    if (direct !== undefined) return direct;
+    let b = ins.bytes;
+    let o = opcodeStart(b);
+    if (b[o.i] !== 0xff) return undefined;
+    let p = o.i + 1;
+    let modrm = b[p++];
+    let mod = modrm >> 6;
+    let rm = modrm & 7;
+    let reg = n => num(regs[REGISTERS_BY_NUMBER[n]]);
+    if (mod === 0 && rm === 5) return num(readU64(ins.addr + ins.len + rel32(b, p)));
+    if (!regs) return undefined;
+    if (mod === 3) return reg(rm | (o.rex & 1 ? 8 : 0));
+    let ea;
+    if (rm === 4) {
+        let sib = b[p++];
+        let index = ((sib >> 3) & 7) | (o.rex & 2 ? 8 : 0);
+        let base = (sib & 7) | (o.rex & 1 ? 8 : 0);
+        ea = index === 4 ? 0 : reg(index) * (1 << (sib >> 6));
+        if ((sib & 7) === 5 && mod === 0) {
+            ea += rel32(b, p);
+            p += 4;
+        } else {
+            ea += reg(base);
+        }
+    } else {
+        ea = reg(rm | (o.rex & 1 ? 8 : 0));
+    }
+    if (mod === 1) ea += signed8(b[p]);
+    else if (mod === 2) ea += rel32(b, p);
+    return num(readU64(ea));
+}
+
+// Where a call to `target` ends up after the incremental-linking and import thunks, and whether
+// stopping there is safe: its module's symbols are loaded, or it is in no module.
+function resolveCode(target) {
+    let table = readModules();
+    for (let hop = 0; hop < 6; hop++) {
+        let m = moduleAt(table, target);
+        if (!m) return { addr: target, safe: true };
+        if (m.deferred) return { addr: target, safe: false, module: m.name };
+        let b = safe(() => targetBytes(target, 8), null);
+        if (!b) return { addr: target, safe: true };
+        if (b[0] === 0xe9) target = target + 5 + rel32(b, 1);
+        else if (b[0] === 0xeb) target = target + 2 + signed8(b[1]);
+        else if (b[0] === 0xff && b[1] === 0x25) target = num(readU64(target + 6 + rel32(b, 2)));
+        else if (b[0] === 0x48 && b[1] === 0xff && b[2] === 0x25) target = num(readU64(target + 7 + rel32(b, 3)));
+        else return { addr: target, safe: true, module: m.name };
+    }
+    return { addr: target, safe: true };
+}
+
+// The instructions of the source line holding addr, from addr on: its calls, returns, and the
+// addresses where execution leaves it (branches out of it, falling through to the next line).
+// `unknown` when an indirect jump (a switch) or its size make that incomplete.
+function scanLine(addr) {
+    let first = instructionAt(addr);
+    let out = { line: first ? first.line : undefined, calls: [], rets: [], exits: [], unknown: false };
+    if (!first || first.line === undefined) {
+        out.unknown = true;
+        return out;
+    }
+    let seen = new Set();
+    let exits = new Set();
+    let work = [addr];
+    let count = 0;
+    while (work.length > 0 && !out.unknown) {
+        let a = work.pop();
+        if (seen.has(a)) continue;
+        for (let ins of disassemblerOf().DisassembleInstructions(a)) {
+            let x = instructionInfo(ins);
+            if (seen.has(x.addr)) break;
+            if (x.line !== out.line || x.fn !== first.fn) {
+                exits.add(x.addr);
+                break;
+            }
+            seen.add(x.addr);
+            if (++count > MAX_LINE_INSTRUCTIONS) {
+                out.unknown = true;
+                break;
+            }
+            if (x.isRet) {
+                out.rets.push(x.addr);
+                break;
+            }
+            if (x.isCall) {
+                let t = callTarget(x, undefined);
+                out.calls.push({ addr: x.addr, len: x.len, target: t === undefined ? undefined : resolveCode(t) });
+                continue;
+            }
+            if (x.isBranch) {
+                let t = directTarget(x);
+                if (t === undefined) {
+                    out.unknown = true;
+                    break;
+                }
+                work.push(t);
+                if (!x.isConditional) break;
+            }
+        }
+    }
+    for (let e of exits) out.exits.push(e);
+    return out;
 }
 
 // --------------------------------------------------------------------- ops
@@ -1984,6 +2241,7 @@ const ops = {
         let regexps = list => (list || []).map(s => new RegExp(s, "i"));
         autoLoad = { local: !!req.local, include: regexps(req.include), exclude: regexps(req.exclude), always: regexps(req.always), program: req.program };
         symbolPaths = { localPath: req.localPath || "", fullPath: req.fullPath || "" };
+        networkDrives = new Set((req.networkDrives || []).map(d => String(d).toUpperCase()));
         setSymbolPath(symbolPaths.localPath);
         return true;
     },
@@ -1995,7 +2253,45 @@ const ops = {
     },
 
     // { command }: a command that loads symbols on request, run with the symbol servers.
-    explicitLoad: (req) => withFullPath(() => commandLines(req.command).join("\n")),
+    // { module, command }: loads symbols on request, with the symbol servers: command (ld, .reload)
+    // for module, or every deferred module when module is "*".
+    explicitLoad: (req) => explicitLoad(req),
+
+    // { tid, scan }: what a Step Into from the thread's current instruction must know (see "steps"):
+    // the instruction (a call's resolved target) and with scan, the calls and exits of the current
+    // line. Addresses are hex strings.
+    stepPlan: (req) => {
+        let th = findThread(req.tid);
+        if (contextFrame !== null) resetContext();
+        let regs = th.Registers.User;
+        let ip = num(regs.rip);
+        let ins = safe(() => instructionAt(ip), null);
+        let hexCode = c => c ? { addr: hexOf(c.addr), safe: c.safe, module: c.module } : undefined;
+        let out = { ip: hexOf(ip), sp: hexOf(num(regs.rsp)), line: ins ? ins.line : undefined, len: ins ? ins.len : 0, isCall: !!ins && ins.isCall };
+        if (ins && ins.isCall) {
+            let t = safe(() => callTarget(ins, regs), undefined);
+            out.call = t === undefined ? { safe: false } : hexCode(resolveCode(t));
+        }
+        if (req.scan) {
+            let s = scanLine(ip);
+            out.scan = {
+                line: s.line,
+                unknown: s.unknown,
+                calls: s.calls.map(c => ({ addr: hexOf(c.addr), target: hexCode(c.target) })),
+                exits: s.exits.map(hexOf)
+            };
+        }
+        return out;
+    },
+
+    // The modules whose symbols are deferred: lower case names without extension. Loads nothing.
+    deferredModules: () => readModules().filter(m => m.deferred).map(m => m.name.toLowerCase()),
+
+    // { addr }: the module holding addr, and whether its symbols are still deferred. Loads nothing.
+    moduleAt: (req) => {
+        let m = moduleAt(readModules(), num(int64(req.addr)));
+        return m ? { name: m.name, deferred: m.deferred } : {};
+    },
 
     // Loads the local PDBs of the modules already loaded (the ones no `ld` event will report).
     autoLoadExisting: () => {
@@ -2128,11 +2424,12 @@ const ops = {
             return { vars: [] };
         };
         currentFrameModule = e.module;
-        return e.noLoad ? withoutLoads(list) : list();
+        return withoutLoads(list);
     },
 
     // req.context is the DAP one. Only the Debug Console ("repl") falls back to dbgeng's search of
-    // every module for a name the frame does not know; a hover never loads symbols.
+    // every module for a name the frame does not know. Nothing loads symbols: a module whose
+    // symbols are deferred is reported (needSymbols) instead.
     evaluate: (req) => {
         ensureContext(req.tid, req.frame);
         let hover = req.context === "hover";
@@ -2149,10 +2446,10 @@ const ops = {
             if (str !== undefined) res.value = str;
             return res;
         };
-        return hover ? withoutLoads(run) : run();
+        return withoutLoads(run);
     },
 
-    setValue: (req) => {
+    setValue: (req) => noLoads(() => {
         let e = getHandle(req.ref);
         let c = childOf(e, req.name);
         if (e.kind === "locals") ensureContext(e.tid, e.fi);
@@ -2163,9 +2460,9 @@ const ops = {
         host.evaluateExpression(target + " = " + req.value);
         let nv = host.evaluateExpression(target);
         return makeVar(e, req.name, nv, c.hint, c.evalName, { hex: !!req.hex, addr: c.addr });
-    },
+    }),
 
-    dataInfo: (req) => {
+    dataInfo: (req) => noLoads(() => {
         let c;
         if (req.ref !== undefined) {
             c = childOf(getHandle(req.ref), req.name);
@@ -2179,7 +2476,7 @@ const ops = {
         if (size === undefined) size = safe(() => num(c.hint.size), undefined);
         if (size === undefined) throw new Error("Unknown value size");
         return { addr: c.addr, size: size };
-    },
+    }),
 
     readMemory: (req) => {
         let addr = int64(req.addr);
@@ -2212,7 +2509,7 @@ const ops = {
 
     cppException: (req) => cppExceptionInfo(req),
 
-    viewString: (req) => {
+    viewString: (req) => noLoads(() => {
         let v;
         if (req.ref !== undefined) {
             v = childOf(getHandle(req.ref), req.name).obj;
@@ -2221,12 +2518,12 @@ const ops = {
             v = evaluateValue(req.expr, { lookup: "lax", tid: req.tid, frame: req.frame }).v;
         }
         return { text: stringOf(v) };
-    },
+    }),
 
     format: (req) => {
         // Formats several expressions at once, used by logpoints.
         ensureContext(req.tid, req.frame);
-        return req.exprs.map(x => {
+        return noLoads(() => req.exprs.map(x => {
             try {
                 let r = evaluateValue(x, { lookup: "strict", tid: req.tid, frame: req.frame });
                 let str = specString(r.v, r.spec);
@@ -2234,7 +2531,7 @@ const ops = {
             } catch (err) {
                 return { ok: false, value: errMsg(err) };
             }
-        });
+        }));
     }
 };
 

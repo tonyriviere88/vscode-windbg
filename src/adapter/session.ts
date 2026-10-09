@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import {
     Breakpoint,
@@ -49,7 +50,8 @@ import {
     parseLogMessage,
 } from './parsers';
 import { ModuleDetails, RawModule, WinDbgModule, parseModuleList, toModule } from './modules';
-import { buildSourcePath, buildSymbolPath, localSymbolPath } from './symbols';
+import { isEmptyNatvis, natvisModuleRefs, neutralizeNatvis } from './natvis';
+import { buildSourcePath, buildSymbolPath, localSymbolPath, networkDrives } from './symbols';
 import { AttachArguments, BridgeVar, ExceptionOverride, FrameInfo, LaunchArguments, NoLoadResult, ThreadInfo } from './types';
 
 const SCRIPT_PATH = path.join(__dirname, '..', '..', '..', 'dbgscript', 'vscode_windbg.js');
@@ -61,6 +63,14 @@ const MAX_JMC_STEPS = 64;
 /** Lines printed by `.symopt` ("Symbol options are 0x...", "0x00000200 - SYMOPT_FAIL_CRITICAL_ERRORS"). */
 const SYMOPT_LISTING = /^\s*(Symbol options are|0x[0-9a-f]+ - SYMOPT_)/i;
 const SYMOPT_NO_UNQUALIFIED_LOADS = 0x100;
+const SYMOPT_IGNORE_CVREC = 0x80;
+/** Bytes per row of the Disassembly view in code whose symbols are deferred. */
+const DISASSEMBLY_ROW = 8;
+/** Ids of the breakpoints a step sets for itself (see StepGuard): below the adapter's own range. */
+const STEP_GUARD_FIRST_ID = 900;
+const STEP_GUARD_ID_COUNT = 100;
+/** Stops a guarded step may make on its own breakpoints before it reports where it is. */
+const MAX_GUARDED_STOPS = 512;
 /** DBG_CONTROL_BREAK: raised in a debugged console process on Ctrl+Break. */
 const CONTROL_BREAK_CODE = 0x40010008;
 
@@ -124,6 +134,38 @@ interface StepState {
     iterations: number;
     /** 'escape': stepping out of external code; 'finish': completing a step interrupted by an ignored stop. */
     phase: 'initial' | 'escape' | 'finish';
+    /** Set while the step runs to breakpoints of its own instead of letting cdb trace (see guardStep). */
+    guard?: StepGuard;
+}
+
+/**
+ * A Step Into that must not stop in code whose symbols are deferred (cdb would load them): it runs
+ * to breakpoints of its own, on the points of the current line that matter: its calls, where
+ * execution leaves it, and the instruction after a call it steps over.
+ */
+interface StepGuard {
+    /** Where to stop; a hit deeper on the stack than minSp (recursion) is not the step's. */
+    stops: Array<{ addr: string; minSp: string }>;
+    /** The line's own stops, kept while stepping over its calls one at a time. */
+    lineStops?: Array<{ addr: string; minSp: string }>;
+    line?: number;
+}
+
+/** What the script tells about a thread's position before a Step Into (op stepPlan). */
+interface StepPlan {
+    ip: string;
+    sp: string;
+    line?: number;
+    len: number;
+    isCall: boolean;
+    /** A call's target after the thunks; safe: its module's symbols are loaded, or it is in no module. */
+    call?: { addr?: string; safe: boolean; module?: string };
+    scan?: {
+        line?: number;
+        unknown: boolean;
+        calls: Array<{ addr: string; target?: { addr: string; safe: boolean; module?: string } }>;
+        exits: string[];
+    };
 }
 
 type StopDecision =
@@ -193,6 +235,23 @@ function errorText(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
 }
 
+interface NatvisState {
+    /** Modification time when last loaded; 0: missing. */
+    mtime: number;
+    /** Modules (lower case) its expressions name. */
+    refs: Set<string>;
+    /** The file loaded in cdb: the natvis file, or a copy naming none of the modules whose symbols are deferred. */
+    loaded?: string;
+    /** The deferred modules that copy renamed: sorted, comma-separated. */
+    neutralized: string;
+}
+
+/** "[External Code] Qt6Core, Qt6Widgets +2": the modules of a run of collapsed frames, in stack order. */
+export function externalCodeLabel(modules: string[]): string {
+    const shown = modules.slice(0, 3).join(', ');
+    return `[External Code] ${shown}${modules.length > 3 ? ` +${modules.length - 3}` : ''}`;
+}
+
 /** A file's modification time; 0 when it cannot be read. */
 function natvisMtime(file: string): number {
     try {
@@ -223,8 +282,12 @@ export class WinDbgSession extends DebugSession {
     private loadAtModuleLoad = false;
     /** The symbol path with the symbol servers, used by explicit loads only. */
     private fullSymbolPath = '';
-    /** User natvis file -> its modification time when last loaded; 0: missing. */
-    private natvisMtimes = new Map<string, number>();
+    /** Drive letters mapped to network shares: what is on them counts as remote. */
+    private networkDrives = new Set<string>();
+    /** User natvis files, by the path given in the launch configuration. */
+    private natvisFiles = new Map<string, NatvisState>();
+    /** Folder of the copies of natvis files that would name modules whose symbols are deferred. */
+    private natvisCopies: string | undefined;
     /** One watcher per folder holding a user natvis file: editors often save by replacing the file. */
     private natvisWatchers: fs.FSWatcher[] = [];
     private natvisTimer: NodeJS.Timeout | undefined;
@@ -294,14 +357,29 @@ export class WinDbgSession extends DebugSession {
         return this.engine.bridge.call<T>(op, args);
     }
 
-    /** A script call that only reads state for VS Code: dropped if the target resumes before it is sent. */
-    private inspect<T>(op: string, args: Record<string, unknown> = {}): Promise<T> {
-        return this.engine.bridge.call<T>(op, args, { inspection: true });
+    /** How long anything VS Code waits for may take in cdb ("evaluationTimeout"); undefined: no limit. */
+    private get requestTimeout(): number | undefined {
+        return this.evaluationTimeoutMs || undefined;
     }
 
-    /** An inspection evaluating expressions or values: interrupted when it runs too long. */
+    /** A script call VS Code waits for: it fails after requestTimeout instead of waiting on cdb. */
+    private request<T>(op: string, args: Record<string, unknown> = {}): Promise<T> {
+        return this.engine.bridge.call<T>(op, args, { timeoutMs: this.requestTimeout });
+    }
+
+    /** A script call that only reads state for VS Code: dropped if the target resumes before it is sent. */
+    private inspect<T>(op: string, args: Record<string, unknown> = {}): Promise<T> {
+        return this.engine.bridge.call<T>(op, args, { inspection: true, timeoutMs: this.requestTimeout });
+    }
+
+    /** An inspection evaluating expressions or values. */
     private evaluation<T>(op: string, args: Record<string, unknown> = {}): Promise<T> {
-        return this.engine.bridge.call<T>(op, args, { inspection: true, timeoutMs: this.evaluationTimeoutMs || undefined });
+        return this.inspect<T>(op, args);
+    }
+
+    /** A cdb command that only reads state for VS Code, like inspect(). */
+    private query(command: string): Promise<string> {
+        return this.exec(command, { inspection: true, timeoutMs: this.requestTimeout });
     }
 
     /**
@@ -487,8 +565,15 @@ export class WinDbgSession extends DebugSession {
         cdb.on('timeout', (label: string, ms: number) =>
             this.log(`cdb was still busy with "${label}" after ${Math.round(ms / 1000)} s ("evaluationTimeout"): interrupting it.`, 'stderr'),
         );
+        const symbolPath = args.symbolPath?.trim() || buildSymbolPath(args.symbols ?? {}, programDir);
+        this.networkDrives = networkDrives(symbolPath);
+        // Stops use no symbol server nor share: whatever cdb loads on its own is searched for locally.
+        const localPath = localSymbolPath(symbolPath, this.networkDrives);
+        this.fullSymbolPath = symbolPath;
         this.log(`WinDbg engine: ${cdbPath}`);
-        cdb.start(cdbPath, commandLine, cwd, childEnv);
+        // Set from the start, not once set up: cdb loads ntdll's symbols as the target starts, and would
+        // search _NT_SYMBOL_PATH (servers, shares) for them. -sins ignores it, for cdb only.
+        cdb.start(cdbPath, `-sins -y ${quoteArg(localPath || 'cache*')} ${commandLine}`, cwd, childEnv);
 
         try {
             await cdb.exec('.echo ready', { label: 'starting the target' });
@@ -501,12 +586,18 @@ export class WinDbgSession extends DebugSession {
             throw new Error(`The debugger could not start the target: ${failure[0].trim()}`);
         }
 
-        const symbolPath = args.symbolPath?.trim() || buildSymbolPath(args.symbols ?? {}, programDir);
-        // Stops use no symbol server: a stack walk loads the symbols of every module on the stack.
-        const localPath = localSymbolPath(symbolPath);
-        this.fullSymbolPath = symbolPath;
         const sourcePath = buildSourcePath(args.sourcePaths, args.sourceServer);
-        const setup = ['.lines -e', 'l+t', 'l-s', 'n 10', `.sympath ${localPath || 'cache*'}`];
+        const setup = [
+            '.lines -e',
+            'l+t',
+            'l-s',
+            'n 10',
+            // The instruction cdb prints at a stop names its call target, loading that module's symbols.
+            '.prompt_allow -dis -ea -reg -src -sym',
+            // The PDB path an image was built with (a build server share...) is only followed by explicit
+            // loads, and only when it is local.
+            `.symopt+ 0x${SYMOPT_IGNORE_CVREC.toString(16)}`,
+        ];
         if (sourcePath) {
             setup.push(`.srcpath ${sourcePath}`);
         }
@@ -527,18 +618,13 @@ export class WinDbgSession extends DebugSession {
         );
         await this.bridge.load(SCRIPT_PATH.includes(' ') ? `"${SCRIPT_PATH}"` : SCRIPT_PATH);
 
-        const natvis = [...(Array.isArray(args.visualizerFile) ? args.visualizerFile : args.visualizerFile ? [args.visualizerFile] : []), ...(args.natvis ?? [])];
-        for (const file of [...new Set(natvis)]) {
-            this.natvisMtimes.set(file, natvisMtime(file));
-            await this.loadNatvis(file, false);
-        }
-        this.watchNatvis();
         const sym = args.symbols ?? {};
         const always = modulePatterns(sym.alwaysLoad);
         this.loadAtModuleLoad = sym.autoLoadLocal !== false || always.length > 0;
         await this.call('configureSymbols', {
             localPath,
             fullPath: symbolPath,
+            networkDrives: [...this.networkDrives],
             local: sym.autoLoadLocal !== false,
             include: modulePatterns(sym.autoLoadInclude),
             exclude: modulePatterns(sym.autoLoadExclude),
@@ -552,6 +638,14 @@ export class WinDbgSession extends DebugSession {
                 this.trace(`[symbols] loaded local PDBs: ${loaded.join(', ')}\n`);
             }
         }
+        // After the startup loads: the natvis loaded in cdb names no module whose symbols are deferred.
+        const natvis = [...(Array.isArray(args.visualizerFile) ? args.visualizerFile : args.visualizerFile ? [args.visualizerFile] : []), ...(args.natvis ?? [])];
+        const deferred = natvis.length > 0 ? await this.deferredModules() : new Set<string>();
+        for (const file of [...new Set(natvis)]) {
+            this.natvisFiles.set(file, { mtime: natvisMtime(file), refs: new Set(), neutralized: '' });
+            await this.loadNatvis(file, deferred);
+        }
+        this.watchNatvis();
         for (const c of args.initCommands ?? []) {
             const out = await cdb.exec(c);
             if (out.trim()) {
@@ -641,7 +735,7 @@ export class WinDbgSession extends DebugSession {
     }
 
     private async where(depth = 16): Promise<Where> {
-        return this.call<Where>('where', { depth });
+        return this.request<Where>('where', { depth });
     }
 
     /**
@@ -686,12 +780,19 @@ export class WinDbgSession extends DebugSession {
                 await this.runInternalJobs();
                 // A selected frame's registers are only the debugger's view: steps start from the thread's own.
                 await this.call('resetContext');
+                if (currentStep) {
+                    cmd = await this.guardStep(cmd, currentStep);
+                    await this.armStepGuard(currentStep);
+                }
                 await this.runInternalJobs();
                 // No await between the last queue check and the command: later jobs need a break-in.
                 this.analyzing = false;
                 const out = await this.engine.cdb.exec(cmd, { onLine: (l) => this.onRunOutput(l), runsTarget: true });
                 this.analyzing = true;
                 this.stopCount++;
+                if (currentStep?.guard) {
+                    await this.exec(`bc ${STEP_GUARD_FIRST_ID}-${STEP_GUARD_FIRST_ID + STEP_GUARD_ID_COUNT - 1}`);
+                }
                 if (currentStep?.instruction) {
                     await this.exec('l+t');
                 }
@@ -721,8 +822,10 @@ export class WinDbgSession extends DebugSession {
                     this.notifyStopWaiters();
                     return;
                 }
-                // A natvis file edited while the target ran applies to the values about to be shown.
+                // A natvis file edited while the target ran applies to the values about to be shown, and
+                // the modules loaded since must not get their symbols loaded by a visualizer.
                 await this.reloadChangedNatvis();
+                await this.syncNatvisWithSymbols();
                 this.reportStop(decision);
                 return;
             }
@@ -804,6 +907,10 @@ export class WinDbgSession extends DebugSession {
         if (!step) {
             return { kind: 'continue', command: 'g' };
         }
+        if (step.guard) {
+            // Running to one of the step's own breakpoints: they are set again.
+            return { kind: 'continue', command: 'g', step };
+        }
         if (step.kind === 'in') {
             // The step was interrupted inside a call it would have entered anyway.
             return { kind: 'continue', command: 'g' };
@@ -813,7 +920,7 @@ export class WinDbgSession extends DebugSession {
 
     private async analyzeStop(_out: string, step: StepState | undefined): Promise<StopDecision> {
         await this.call('reset');
-        const le = parseLastEvent(await this.exec('.lastevent'));
+        const le = parseLastEvent(await this.exec('.lastevent', { timeoutMs: this.requestTimeout }));
         await this.runInternalJobs();
         if (this.terminating) {
             return { kind: 'halt' };
@@ -845,6 +952,9 @@ export class WinDbgSession extends DebugSession {
         }
 
         if (le.kind === 'breakpoint') {
+            if (step?.guard && le.id >= STEP_GUARD_FIRST_ID && le.id < STEP_GUARD_FIRST_ID + STEP_GUARD_ID_COUNT) {
+                return this.continueGuard(step, where);
+            }
             if (this.entryBps.includes(le.id)) {
                 await this.clearEntryBreakpoints();
                 return { kind: 'report', reason: 'entry', tid: await tid() };
@@ -905,11 +1015,11 @@ export class WinDbgSession extends DebugSession {
      */
     private async isRemovedBreakpointHit(): Promise<boolean> {
         try {
-            const addr = parseExceptionRecord(await this.exec('.exr -1')).address;
+            const addr = parseExceptionRecord(await this.exec('.exr -1', { timeoutMs: this.requestTimeout })).address;
             if (!addr) {
                 return false;
             }
-            const res = await this.call<{ hex: string }>('readMemory', { addr, count: 1 });
+            const res = await this.request<{ hex: string }>('readMemory', { addr, count: 1 });
             return res.hex.length === 2 && res.hex.toLowerCase() !== 'cc';
         } catch {
             return false;
@@ -919,11 +1029,11 @@ export class WinDbgSession extends DebugSession {
     private async pauseThread(breakinTid: number): Promise<number> {
         // The break-in thread is not interesting; show the previously stopped thread or the main thread.
         try {
-            const t = await this.call<{ threads: ThreadInfo[] }>('threads');
+            const t = await this.request<{ threads: ThreadInfo[] }>('threads');
             const candidates = t.threads.filter((x) => x.id !== breakinTid);
             const pick = candidates.find((x) => x.id === this.lastStopTid) ?? candidates[0];
             if (pick) {
-                await this.call('switchTo', { tid: pick.id, frame: 0 });
+                await this.request('switchTo', { tid: pick.id, frame: 0 });
                 return pick.id;
             }
         } catch {
@@ -979,6 +1089,87 @@ export class WinDbgSession extends DebugSession {
         return { kind: 'continue', command: 'g' };
     }
 
+    /**
+     * The command a step runs next. With Just My Code, code whose symbols are deferred is external,
+     * and Step Into must not stop in it: cdb loads the symbols of the module it stops in (and of its
+     * caller). A call into it is stepped over, through breakpoints of the step's own (step.guard).
+     * Without Just My Code, and for instruction steps, cdb steps into it, loading its symbols.
+     * Step Over and Step Out never stop in it: a stop in its callee already loaded it.
+     */
+    private async guardStep(cmd: string, step: StepState): Promise<string> {
+        if (cmd === 'g') {
+            // To the step's own breakpoints, set again.
+            return cmd;
+        }
+        step.guard = undefined;
+        if (cmd !== 't' || step.instruction || !this.jmc.enabled) {
+            return cmd;
+        }
+        let plan: StepPlan;
+        try {
+            plan = await this.request<StepPlan>('stepPlan', { tid: step.tid, scan: true });
+        } catch (e) {
+            this.trace(`[step] no plan, cdb steps: ${errorText(e)}\n`);
+            return cmd;
+        }
+        const next = this.planStepIn(step, plan);
+        this.trace(`[step] t -> ${next}${step.guard ? ` ${JSON.stringify(step.guard)}` : ''}\n`);
+        return next;
+    }
+
+    private planStepIn(step: StepState, plan: StepPlan): string {
+        const scan = plan.scan && !plan.scan.unknown ? plan.scan : undefined;
+        // The line's calls (decided on when reached) and its exits; the current instruction is decided now.
+        const lineStops = scan ? [...scan.calls.map((c) => c.addr), ...scan.exits].filter((a) => a !== plan.ip).map((addr) => ({ addr, minSp: plan.sp })) : undefined;
+        if (plan.isCall) {
+            if (plan.call?.safe) {
+                return 't';
+            }
+            // Over the call: to the instruction after it, or to the line's other stops.
+            const after = (BigInt('0x' + plan.ip) + BigInt(plan.len)).toString(16);
+            step.guard = { stops: [{ addr: after, minSp: plan.sp }, ...(lineStops ?? [])], lineStops, line: plan.line };
+            return 'g';
+        }
+        // An indirect jump (a switch) the scan cannot follow, or no call into deferred code: cdb steps.
+        if (!scan || !lineStops || !scan.calls.some((c) => !c.target?.safe) || lineStops.length >= STEP_GUARD_ID_COUNT) {
+            return 't';
+        }
+        step.guard = { stops: lineStops, lineStops, line: scan.line };
+        return 'g';
+    }
+
+    /** Sets the step's own breakpoints, on the stepping thread only. */
+    private async armStepGuard(step: StepState): Promise<void> {
+        const stops = step.guard?.stops ?? [];
+        if (stops.length === 0) {
+            return;
+        }
+        const thread = `~~[0x${step.tid.toString(16)}]`;
+        await this.exec(stops.slice(0, STEP_GUARD_ID_COUNT).map((s, i) => `${thread}bp${STEP_GUARD_FIRST_ID + i} 0x${s.addr}`).join(';'));
+    }
+
+    /** A guarded Step Into reached one of its breakpoints. */
+    private async continueGuard(step: StepState, where: () => Promise<Where>): Promise<StopDecision> {
+        const guard = step.guard!;
+        step.guard = undefined;
+        if (++step.iterations > MAX_GUARDED_STOPS) {
+            return { kind: 'report', reason: 'step', tid: (await where()).tid };
+        }
+        const plan = await this.request<StepPlan>('stepPlan', { tid: step.tid, scan: false });
+        const hit = guard.stops.find((s) => BigInt('0x' + s.addr) === BigInt('0x' + plan.ip));
+        if (hit && BigInt('0x' + plan.sp) < BigInt('0x' + hit.minSp)) {
+            // A deeper call of the function (recursion) got there: not the step's stop.
+            step.guard = guard;
+            return { kind: 'continue', command: 'g', step };
+        }
+        if (plan.line !== guard.line) {
+            // Past the line: the usual rules decide.
+            return this.continueStep(step, await where());
+        }
+        // A call of the line, or the instruction after a call stepped over: on from here.
+        return { kind: 'continue', command: 't', step };
+    }
+
     private async describeException(le: Extract<LastEvent, { kind: 'exception' }>): Promise<ExceptionState> {
         const state: ExceptionState = {
             code: le.code,
@@ -989,9 +1180,9 @@ export class WinDbgSession extends DebugSession {
         };
         if (le.code === CPP_EXCEPTION_CODE) {
             try {
-                const rec = parseExceptionRecord(await this.exec('.exr -1'));
+                const rec = parseExceptionRecord(await this.exec('.exr -1', { timeoutMs: this.requestTimeout }));
                 if (rec.params.length >= 3) {
-                    const info = await this.call<{ types: string[]; what?: string }>('cppException', { params: rec.params });
+                    const info = await this.request<{ types: string[]; what?: string }>('cppException', { params: rec.params });
                     if (info.types.length > 0) {
                         state.typeName = info.types[0];
                         state.id = info.types[0];
@@ -1087,32 +1278,93 @@ export class WinDbgSession extends DebugSession {
         );
     }
 
-    /** Loads a user natvis file; `reload` unloads it first, as cdb ignores a file it already loaded. */
-    private async loadNatvis(file: string, reload: boolean): Promise<void> {
-        const quoted = file.includes(' ') ? `"${file}"` : file;
-        if (reload) {
-            await this.exec(`.nvunload ${quoted}`);
+    /** The modules (lower case, without extension) whose symbols are deferred. */
+    private async deferredModules(): Promise<Set<string>> {
+        return new Set(await this.request<string[]>('deferredModules'));
+    }
+
+    /**
+     * Loads a user natvis file, or loads it again (cdb ignores a file it already loaded). The
+     * modules of `deferred` its expressions name are renamed in a copy, loaded instead: showing a
+     * value never loads their symbols.
+     */
+    private async loadNatvis(file: string, deferred: ReadonlySet<string>, why: 'load' | 'edit' | 'symbols' = 'load'): Promise<void> {
+        const state = this.natvisFiles.get(file)!;
+        let text: string | undefined;
+        try {
+            text = fs.readFileSync(file, 'utf8');
+        } catch {
+            // cdb reports it
         }
-        const out = await this.exec(`.nvload ${quoted}`);
+        const quote = (f: string) => (f.includes(' ') ? `"${f}"` : f);
+        if (text !== undefined && isEmptyNatvis(text)) {
+            // cdb refuses a file without visualizers: there is nothing to load.
+            if (state.loaded) {
+                await this.exec(`.nvunload ${quote(state.loaded)}`);
+                state.loaded = undefined;
+            }
+            state.refs = new Set();
+            state.neutralized = '';
+            this.trace(`[natvis] ${file} skipped: no visualizer\n`);
+            return;
+        }
+        state.refs = text === undefined ? new Set() : natvisModuleRefs(text);
+        const renamed = [...state.refs].filter((m) => deferred.has(m)).sort();
+        state.neutralized = renamed.join(',');
+        let target = file;
+        if (text !== undefined && renamed.length > 0) {
+            this.natvisCopies ??= fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-windbg-natvis-'));
+            target = path.join(this.natvisCopies, `${[...this.natvisFiles.keys()].indexOf(file)}-${path.basename(file)}`);
+            fs.writeFileSync(target, neutralizeNatvis(text, new Set(renamed)));
+        }
+        if (state.loaded) {
+            await this.exec(`.nvunload ${quote(state.loaded)}`);
+        }
+        const out = (await this.exec(`.nvload ${quote(target)}`)).split(target).join(file);
+        state.loaded = target;
         if (/error|fail|unable/i.test(out) && !/successfully loaded/i.test(out)) {
             this.log(`natvis ${file}: ${out.trim()}`, 'stderr');
+        } else if (why === 'symbols') {
+            this.trace(`[natvis] ${file} loaded again, renaming: ${state.neutralized || 'nothing'}\n`);
         } else {
-            this.log(`${reload ? 'Reloaded' : 'Loaded'} natvis: ${file}`);
+            this.log(`${why === 'edit' ? 'Reloaded' : 'Loaded'} natvis: ${file}`);
         }
     }
 
     /** Reloads the user natvis files changed on disk since they were loaded; true when one was. */
     private async reloadChangedNatvis(): Promise<boolean> {
+        let deferred: Set<string> | undefined;
         let changed = false;
-        for (const [file, loaded] of this.natvisMtimes) {
+        for (const [file, state] of this.natvisFiles) {
             const mtime = natvisMtime(file);
             // A deleted file stays loaded: it is reloaded once it is back.
-            if (mtime === loaded || mtime === 0) {
+            if (mtime === state.mtime || mtime === 0) {
                 continue;
             }
-            this.natvisMtimes.set(file, mtime);
-            await this.loadNatvis(file, true);
+            state.mtime = mtime;
+            deferred ??= await this.deferredModules();
+            await this.loadNatvis(file, deferred, 'edit');
             changed = true;
+        }
+        return changed;
+    }
+
+    /**
+     * Loads again the natvis files naming a module whose symbols got loaded, or a module loaded
+     * since with its symbols deferred; true when one was.
+     */
+    private async syncNatvisWithSymbols(): Promise<boolean> {
+        const naming = [...this.natvisFiles].filter(([, s]) => s.refs.size > 0);
+        if (naming.length === 0) {
+            return false;
+        }
+        const deferred = await this.deferredModules();
+        let changed = false;
+        for (const [file, state] of naming) {
+            if ([...state.refs].filter((m) => deferred.has(m)).sort().join(',') !== state.neutralized) {
+                await this.loadNatvis(file, deferred, 'symbols');
+                changed = true;
+            }
         }
         return changed;
     }
@@ -1123,7 +1375,7 @@ export class WinDbgSession extends DebugSession {
      */
     private watchNatvis(): void {
         const byFolder = new Map<string, Set<string>>();
-        for (const file of this.natvisMtimes.keys()) {
+        for (const file of this.natvisFiles.keys()) {
             const full = path.resolve(file);
             const folder = path.dirname(full);
             byFolder.set(folder, (byFolder.get(folder) ?? new Set()).add(path.basename(full).toLowerCase()));
@@ -1165,6 +1417,14 @@ export class WinDbgSession extends DebugSession {
         clearTimeout(this.natvisTimer);
         for (const watcher of this.natvisWatchers.splice(0)) {
             watcher.close();
+        }
+        if (this.natvisCopies) {
+            try {
+                fs.rmSync(this.natvisCopies, { recursive: true, force: true });
+            } catch {
+                // left in the temporary folder
+            }
+            this.natvisCopies = undefined;
         }
     }
 
@@ -1219,10 +1479,10 @@ export class WinDbgSession extends DebugSession {
         let where = this.lastWhere;
         try {
             if (!where || where.tid !== threadId) {
-                await this.call('switchTo', { tid: threadId, frame: 0 });
+                await this.request('switchTo', { tid: threadId, frame: 0 });
                 where = await this.where(MAX_JMC_STEPS);
             } else {
-                await this.call('switchTo', { tid: threadId, frame: 0 });
+                await this.request('switchTo', { tid: threadId, frame: 0 });
             }
         } catch (e) {
             this.log(`Debugger error: ${errorText(e)}`, 'stderr');
@@ -1277,7 +1537,7 @@ export class WinDbgSession extends DebugSession {
     protected async gotoTargetsRequest(response: DebugProtocol.GotoTargetsResponse, args: DebugProtocol.GotoTargetsArguments): Promise<void> {
         try {
             const file = this.toCompiledPath(args.source.path ?? '');
-            const out = await this.exec(`? \`${file}:${args.line}\``);
+            const out = await this.query(`? \`${file}:${args.line}\``);
             const m = /=\s*([0-9a-f]{8}`?[0-9a-f]{0,8})/i.exec(out);
             if (!m) {
                 throw new Error(out.trim() || 'No code at this line.');
@@ -1298,8 +1558,8 @@ export class WinDbgSession extends DebugSession {
             return;
         }
         try {
-            await this.call('switchTo', { tid: args.threadId, frame: 0 });
-            await this.exec(`r @$ip = 0x${addr}`);
+            await this.request('switchTo', { tid: args.threadId, frame: 0 });
+            await this.exec(`r @$ip = 0x${addr}`, { timeoutMs: this.requestTimeout });
             this.sendResponse(response);
             await this.call('reset');
             this.lastWhere = await this.where();
@@ -1479,7 +1739,7 @@ export class WinDbgSession extends DebugSession {
         if (recs.length === 0) {
             return;
         }
-        const list = parseBreakpointList(await this.exec('bl'));
+        const list = parseBreakpointList(await this.exec('bl', { timeoutMs: this.requestTimeout }));
         for (const r of recs) {
             const e = list.get(r.cdbId);
             if (!e) {
@@ -1544,10 +1804,15 @@ export class WinDbgSession extends DebugSession {
         }
     }
 
-    /** Frames shown as module+offset get their names once the module's symbols are loaded. */
-    private invalidateStacksAfterLoad(): void {
+    /**
+     * After symbols were loaded on request: natvis files naming the module load again unchanged,
+     * frames shown as module+offset get their names, and values needing the module (a watch that
+     * said its symbols were not loaded, a dynamic type) are shown again.
+     */
+    private async afterExplicitLoad(): Promise<void> {
+        await this.syncNatvisWithSymbols();
         if (this.state === 'stopped') {
-            this.sendEvent(new InvalidatedEvent(['stacks']));
+            this.sendEvent(new InvalidatedEvent(['stacks', 'variables']));
         }
     }
 
@@ -1680,10 +1945,10 @@ export class WinDbgSession extends DebugSession {
         try {
             let info: { addr: string; size: number };
             if (args.variablesReference) {
-                info = await this.call('dataInfo', { ref: args.variablesReference, name: args.name });
+                info = await this.request('dataInfo', { ref: args.variablesReference, name: args.name });
             } else {
                 const fr = args.frameId !== undefined ? this.frames.get(args.frameId) : undefined;
-                info = await this.call('dataInfo', { expr: args.name, tid: fr?.tid, frame: fr?.index ?? 0 });
+                info = await this.request('dataInfo', { expr: args.name, tid: fr?.tid, frame: fr?.index ?? 0 });
             }
             const size = [8, 4, 2, 1].find((s) => s <= info.size) ?? 1;
             response.body = {
@@ -1848,19 +2113,26 @@ export class WinDbgSession extends DebugSession {
             let frames: DebugProtocol.StackFrame[];
             if (collapse) {
                 frames = [];
-                let externalRun = false;
+                // The label of the current run of external frames, and the modules it covers.
+                let run: { label: DebugProtocol.StackFrame; modules: string[] } | undefined;
                 res.frames.forEach((f, idx) => {
                     const user = this.isUserFrame(f);
                     if (user || idx === 0) {
                         frames.push(this.toDapFrame(f, args.threadId));
-                        externalRun = false;
-                    } else if (!externalRun) {
+                        run = undefined;
+                        return;
+                    }
+                    if (!run) {
                         const id = this.nextFrameId++;
                         this.frames.set(id, { tid: args.threadId, index: f.i });
-                        const label = new StackFrame(id, '[External Code]') as DebugProtocol.StackFrame;
-                        label.presentationHint = 'label';
-                        frames.push(label);
-                        externalRun = true;
+                        run = { label: new StackFrame(id, '[External Code]') as DebugProtocol.StackFrame, modules: [] };
+                        run.label.presentationHint = 'label';
+                        frames.push(run.label);
+                    }
+                    const module = f.mod ?? parseFrameText(f.text ?? '').module;
+                    if (module && !run.modules.some((m) => m.toLowerCase() === module.toLowerCase())) {
+                        run.modules.push(module);
+                        run.label.name = externalCodeLabel(run.modules);
                     }
                 });
                 response.body = { stackFrames: frames, totalFrames: frames.length };
@@ -1927,7 +2199,7 @@ export class WinDbgSession extends DebugSession {
                 count: args.count,
                 hex: args.format?.hex ?? this.hexDefault,
             });
-            this.reportNoLoad(res, undefined);
+            this.reportNoLoad(res, undefined, 'variables');
             if (res.failed !== undefined) {
                 throw new Error(res.failed);
             }
@@ -1940,7 +2212,7 @@ export class WinDbgSession extends DebugSession {
 
     protected async setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): Promise<void> {
         try {
-            const v = await this.call<BridgeVar>('setValue', { ref: args.variablesReference, name: args.name, value: args.value, hex: args.format?.hex ?? false });
+            const v = await this.request<BridgeVar>('setValue', { ref: args.variablesReference, name: args.name, value: args.value, hex: args.format?.hex ?? false });
             response.body = { value: v.value, type: v.type, variablesReference: v.ref ?? 0, indexedVariables: v.indexed };
             this.sendResponse(response);
         } catch (e) {
@@ -1981,7 +2253,7 @@ export class WinDbgSession extends DebugSession {
                 hex: args.format?.hex ?? this.hexDefault,
                 context: args.context,
             });
-            this.reportNoLoad(v, args.expression.trim());
+            this.reportNoLoad(v, args.expression.trim(), args.context);
             if (v.failed !== undefined) {
                 throw new Error(v.failed);
             }
@@ -1999,15 +2271,15 @@ export class WinDbgSession extends DebugSession {
     }
 
     /**
-     * A hover never loads symbols: the extension offers to load the modules it would have needed.
-     * Modules loaded anyway (natvis naming another module) are logged, as they explain a slow hover.
+     * Showing a value never loads symbols: the extension offers to load the modules it would have
+     * needed. Modules loaded anyway are logged, as they explain a slow view.
      */
-    private reportNoLoad(r: NoLoadResult, expression: string | undefined): void {
+    private reportNoLoad(r: NoLoadResult, expression: string | undefined, context: string | undefined): void {
         if (r.needSymbols && r.needSymbols.length > 0) {
-            this.sendEvent(new Event('windbgNeedSymbols', { expression, modules: r.needSymbols }));
+            this.sendEvent(new Event('windbgNeedSymbols', { expression, context, modules: r.needSymbols }));
         }
         if (r.loadedSymbols && r.loadedSymbols.length > 0) {
-            this.log(`Showing ${expression ? `"${expression}"` : 'a hover value'} loaded the symbols of ${r.loadedSymbols.join(', ')} (a natvis visualizer refers to them).`);
+            this.log(`Showing ${expression ? `"${expression}"` : 'a value'} loaded the symbols of ${r.loadedSymbols.join(', ')}.`);
         }
     }
 
@@ -2065,8 +2337,9 @@ export class WinDbgSession extends DebugSession {
         return {
             output,
             after: async () => {
-                // The command may have changed breakpoints or memory.
+                // The command may have changed breakpoints or memory, or loaded symbols.
                 await this.call('reset');
+                await this.syncNatvisWithSymbols();
                 this.sendEvent(new InvalidatedEvent(['variables']));
             },
         };
@@ -2086,7 +2359,7 @@ export class WinDbgSession extends DebugSession {
         try {
             const addr = BigInt(args.memoryReference) + BigInt(args.offset ?? 0);
             const count = Math.min(args.count, 1024 * 1024);
-            const res = await this.call<{ hex: string; unreadable: number }>('readMemory', { addr: addr.toString(16), count });
+            const res = await this.request<{ hex: string; unreadable: number }>('readMemory', { addr: addr.toString(16), count });
             response.body = { address: `0x${addr.toString(16)}`, data: Buffer.from(res.hex, 'hex').toString('base64'), unreadableBytes: res.unreadable };
             this.sendResponse(response);
         } catch (e) {
@@ -2098,7 +2371,7 @@ export class WinDbgSession extends DebugSession {
         try {
             const addr = BigInt(args.memoryReference) + BigInt(args.offset ?? 0);
             const hex = Buffer.from(args.data, 'base64').toString('hex');
-            const res = await this.call<{ written: number }>('writeMemory', { addr: addr.toString(16), hex });
+            const res = await this.request<{ written: number }>('writeMemory', { addr: addr.toString(16), hex });
             response.body = { bytesWritten: res.written };
             this.sendResponse(response);
             this.sendEvent(new InvalidatedEvent(['variables']));
@@ -2107,14 +2380,45 @@ export class WinDbgSession extends DebugSession {
         }
     }
 
+    /**
+     * Code of a module whose symbols are deferred: cdb's disassembly names addresses, which loads
+     * them. Its bytes are shown instead, DISASSEMBLY_ROW bytes per row.
+     */
+    private async rawDisassembly(module: string, base: bigint, args: DebugProtocol.DisassembleArguments): Promise<DebugProtocol.DisassembledInstruction[]> {
+        const start = base + BigInt((args.instructionOffset ?? 0) * DISASSEMBLY_ROW);
+        const res = await this.request<{ hex: string }>('readMemory', { addr: start.toString(16), count: args.instructionCount * DISASSEMBLY_ROW });
+        const out: DebugProtocol.DisassembledInstruction[] = [];
+        for (let i = 0; i < args.instructionCount; i++) {
+            const address = `0x${(start + BigInt(i * DISASSEMBLY_ROW)).toString(16)}`;
+            const hex = res.hex.slice(i * DISASSEMBLY_ROW * 2, (i + 1) * DISASSEMBLY_ROW * 2);
+            if (!hex) {
+                out.push({ address, instruction: '??', presentationHint: 'invalid' });
+                continue;
+            }
+            const bytes = hex.match(/../g)!.join(' ');
+            out.push({ address, instructionBytes: bytes, instruction: `db ${bytes}` });
+        }
+        const first = out.find((x) => x.presentationHint !== 'invalid');
+        if (first) {
+            first.symbol = `${module}: symbols not loaded (Load Symbols to disassemble)`;
+        }
+        return out;
+    }
+
     protected async disassembleRequest(response: DebugProtocol.DisassembleResponse, args: DebugProtocol.DisassembleArguments): Promise<void> {
         try {
             const base = BigInt(args.memoryReference) + BigInt(args.offset ?? 0);
+            const at = await this.request<{ name?: string; deferred?: boolean }>('moduleAt', { addr: base.toString(16) });
+            if (at.name && at.deferred) {
+                response.body = { instructions: await this.rawDisassembly(at.name, base, args) };
+                this.sendResponse(response);
+                return;
+            }
             const before = Math.max(0, -(args.instructionOffset ?? 0));
             const skip = Math.max(0, args.instructionOffset ?? 0);
             const lines: ReturnType<typeof parseDisassembly> = [];
             if (before > 0) {
-                const ub = parseDisassembly(await this.exec(`ub 0x${base.toString(16)} L${before}`));
+                const ub = parseDisassembly(await this.query(`ub 0x${base.toString(16)} L${before}`));
                 while (ub.length < before) {
                     ub.unshift({ address: '0', bytes: '', text: '??' });
                 }
@@ -2122,7 +2426,7 @@ export class WinDbgSession extends DebugSession {
             }
             const after = args.instructionCount - lines.length + skip;
             if (after > 0) {
-                const u = parseDisassembly(await this.exec(`u 0x${base.toString(16)} L${after}`));
+                const u = parseDisassembly(await this.query(`u 0x${base.toString(16)} L${after}`));
                 lines.push(...u.slice(skip));
             }
             const instructions: DebugProtocol.DisassembledInstruction[] = lines.slice(0, args.instructionCount).map((l) => {
@@ -2157,10 +2461,10 @@ export class WinDbgSession extends DebugSession {
     // -------------------------------------------------------- modules
 
     private async listModules(inspection = false): Promise<WinDbgModule[]> {
-        const raw = await this.engine.bridge.call<RawModule[]>('modules', {}, { inspection });
+        const raw = await this.engine.bridge.call<RawModule[]>('modules', {}, { inspection, timeoutMs: this.requestTimeout });
         let details = new Map<string, ModuleDetails>();
         try {
-            details = parseModuleList(await this.exec('lmv', { inspection }));
+            details = parseModuleList(await this.exec('lmv', { inspection, timeoutMs: this.requestTimeout }));
         } catch (e) {
             if (e instanceof CancelledError) {
                 throw e;
@@ -2231,7 +2535,7 @@ export class WinDbgSession extends DebugSession {
                     break;
                 }
                 case 'selectFrame':
-                    await this.call('switchTo', { tid: args.threadId, frame: args.frameIndex ?? 0 });
+                    await this.request('switchTo', { tid: args.threadId, frame: args.frameIndex ?? 0 });
                     response.body = {};
                     break;
                 case 'runCommand': {
@@ -2288,11 +2592,11 @@ export class WinDbgSession extends DebugSession {
                     // args.module: a module's short name, or undefined for all modules.
                     const target = typeof args?.module === 'string' && args.module ? args.module : '*';
                     const out = await this.runWhenStopped(async () => {
-                        const text = await this.call<string>('explicitLoad', { command: `ld ${target}` });
+                        const text = await this.call<string>('explicitLoad', { module: target, command: `ld ${target}` });
                         for (const rec of await this.bindPendingBreakpoints()) {
                             this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(rec)));
                         }
-                        this.invalidateStacksAfterLoad();
+                        await this.afterExplicitLoad();
                         return text;
                     });
                     response.body = { output: out, modules: await this.runWhenStopped(() => this.listModules()) };
@@ -2307,9 +2611,10 @@ export class WinDbgSession extends DebugSession {
                     const out = await this.runWhenStopped(async () => {
                         await this.exec('!sym noisy');
                         try {
-                            return await this.call<string>('explicitLoad', { command: `.reload /f ${image.includes(' ') ? `"${image}"` : image}` });
+                            return await this.call<string>('explicitLoad', { module: image, command: `.reload /f ${image.includes(' ') ? `"${image}"` : image}` });
                         } finally {
                             await this.exec(this.args.symbols?.verbose ? '!sym noisy' : '!sym quiet');
+                            await this.afterExplicitLoad();
                         }
                     });
                     const sympath = `Symbol search path is: ${this.fullSymbolPath}`;
@@ -2334,17 +2639,21 @@ export class WinDbgSession extends DebugSession {
                             this.loadAtModuleLoad = true;
                             await this.applyExceptionPolicy();
                         }
-                        await this.call<string>('explicitLoad', { command: `ld ${moduleBaseName(module)}` });
+                        await this.call<string>('explicitLoad', { module: moduleBaseName(module), command: `ld ${moduleBaseName(module)}` });
                         for (const rec of await this.bindPendingBreakpoints()) {
                             this.sendEvent(new BreakpointEvent('changed', this.toDapBreakpoint(rec)));
                         }
-                        this.invalidateStacksAfterLoad();
+                        await this.afterExplicitLoad();
                     });
                     response.body = { modules: await this.runWhenStopped(() => this.listModules()) };
                     break;
                 }
                 case 'reloadSymbols': {
-                    const out = await this.runWhenStopped(() => this.exec('.reload'));
+                    const out = await this.runWhenStopped(async () => {
+                        const text = await this.exec('.reload');
+                        await this.afterExplicitLoad();
+                        return text;
+                    });
                     response.body = { output: out };
                     break;
                 }

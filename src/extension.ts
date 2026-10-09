@@ -27,11 +27,27 @@ interface ExceptionEvent {
 
 interface NeedSymbolsEvent {
     expression?: string;
+    /** Where the value was shown: the DAP evaluate context, or "variables". */
+    context?: string;
     modules: Array<{ module: string; type?: string }>;
 }
 
+/** The view a value was shown in, for messages. */
+function viewName(context: string | undefined): string {
+    switch (context) {
+        case 'watch':
+            return 'the Watch view';
+        case 'repl':
+            return 'the Debug Console';
+        case 'variables':
+            return 'the Variables view';
+        default:
+            return 'the hover';
+    }
+}
+
 let showExternalCode = false;
-/** Modules already offered for loading, per debug session: a hover asks once per module. */
+/** Modules already offered for loading, per debug session: a view asks once per module. */
 const offeredSymbols = new Map<string, Set<string>>();
 
 function guessLanguage(text: string): string {
@@ -167,15 +183,20 @@ async function onNeedSymbols(session: vscode.DebugSession, e: NeedSymbolsEvent):
         }
         offered.add(key);
         const what = e.expression ? `"${e.expression}"` : 'this value';
+        const view = viewName(e.context);
         const message = m.type
-            ? `${what} is a ${m.type}, described by the symbols of ${m.module}, which are not loaded. The hover shows its declared type instead.`
-            : `The symbols of ${m.module} are not loaded, so the hover cannot show ${what}.`;
+            ? `${what} is a ${m.type}, described by the symbols of ${m.module}, which are not loaded. ${view[0].toUpperCase() + view.slice(1)} shows its declared type instead.`
+            : `The symbols of ${m.module} are not loaded, so ${view} cannot show ${what}.`;
         const choice = await vscode.window.showInformationMessage(message, 'Load Symbols');
         if (choice) {
             await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Loading symbols for ${m.module}` }, async () => {
                 try {
-                    await session.customRequest('loadSymbols', { module: m.module });
+                    const res = (await session.customRequest('loadSymbols', { module: m.module })) as { modules?: Array<{ shortName: string; symbolKind: string }> };
                     await vscode.commands.executeCommand('windbg.modules.refresh');
+                    const now = res.modules?.find((x) => x.shortName.toLowerCase() === m.module.toLowerCase());
+                    if (now && now.symbolKind !== 'pdb') {
+                        void vscode.window.showWarningMessage(`No PDB was found for ${m.module}: see Symbol Load Information in the WinDbg Modules view.`);
+                    }
                 } catch (err) {
                     void vscode.window.showErrorMessage(`Loading symbols failed: ${(err as Error).message}`);
                 }

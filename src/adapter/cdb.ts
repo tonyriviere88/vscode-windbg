@@ -11,14 +11,18 @@ export interface ExecOptions {
     inspection?: boolean;
     /** Name used in slow command reports instead of the command text. */
     label?: string;
-    /** Interrupts the command (Ctrl+Break) and fails it when it still runs after this long. */
+    /**
+     * Fails the command when it is not done this long after it was queued: still queued, it is
+     * dropped; running, it is interrupted (Ctrl+Break). Either way it fails at once, without waiting
+     * for cdb: what it prints afterwards is ignored.
+     */
     timeoutMs?: number;
 }
 
 /** Rejects a queued command that was dropped before it was sent. */
 export class CancelledError extends Error {}
 
-/** Rejects a command that was interrupted because it ran longer than its timeoutMs. */
+/** Rejects a command that was not done within its timeoutMs. */
 export class TimeoutError extends Error {}
 
 /** A command that has not finished after this long is reported through the 'slow' event. */
@@ -37,7 +41,9 @@ interface Pending {
     partial: string;
     sentAt?: number;
     slow?: boolean;
-    timedOut?: boolean;
+    /** Already resolved or rejected: a timeout answered it before cdb did. */
+    settled?: boolean;
+    deadline?: NodeJS.Timeout;
 }
 
 /**
@@ -64,7 +70,6 @@ export class Cdb extends EventEmitter {
     private buffer = '';
     private exitedFlag = false;
     private slowTimer: NodeJS.Timeout | undefined;
-    private timeoutTimer: NodeJS.Timeout | undefined;
     /** Output received before the first command, i.e. the startup banner. */
     public startupOutput = '';
 
@@ -114,9 +119,45 @@ export class Cdb extends EventEmitter {
             return Promise.reject(new Error('The debugger process has exited.'));
         }
         return new Promise<string>((resolve, reject) => {
-            this.queue.push({ id: ++this.seq, command, options, resolve, reject, begun: false, body: '', partial: '' });
+            const p: Pending = { id: ++this.seq, command, options, resolve, reject, begun: false, body: '', partial: '' };
+            if (options.timeoutMs) {
+                p.deadline = setTimeout(() => this.expire(p), options.timeoutMs);
+                p.deadline.unref?.();
+            }
+            this.queue.push(p);
             this.pump();
         });
+    }
+
+    /** A command not done in time: fails it now, and interrupts it when cdb is running it. */
+    private expire(p: Pending): void {
+        if (p.settled) {
+            return;
+        }
+        const seconds = Math.round(p.options.timeoutMs! / 1000);
+        if (this.current === p) {
+            this.emit('timeout', this.labelOf(p), p.options.timeoutMs);
+            this.interrupt();
+            this.settle(p, new TimeoutError(`No answer after ${seconds} s: the debugger was still working on it.`));
+            return;
+        }
+        this.queue = this.queue.filter((q) => q !== p);
+        const busy = this.current ? ` with "${this.labelOf(this.current)}"` : '';
+        this.settle(p, new TimeoutError(`No answer after ${seconds} s: the debugger is busy${busy}.`));
+    }
+
+    /** Resolves (output) or rejects (error) a command, once. */
+    private settle(p: Pending, result: string | Error): void {
+        if (p.settled) {
+            return;
+        }
+        p.settled = true;
+        clearTimeout(p.deadline);
+        if (typeof result === 'string') {
+            p.resolve(result);
+        } else {
+            p.reject(result);
+        }
     }
 
     get busy(): boolean {
@@ -131,7 +172,7 @@ export class Cdb extends EventEmitter {
         }
         this.queue = this.queue.filter((p) => !p.options.inspection);
         for (const p of dropped) {
-            p.reject(new CancelledError(message));
+            this.settle(p, new CancelledError(message));
         }
         return dropped.length;
     }
@@ -178,16 +219,6 @@ export class Cdb extends EventEmitter {
             this.slowTimer.unref?.();
         };
         schedule(this.slowMs);
-        if (p.options.timeoutMs) {
-            this.timeoutTimer = setTimeout(() => {
-                if (this.current === p) {
-                    p.timedOut = true;
-                    this.emit('timeout', this.labelOf(p), p.options.timeoutMs);
-                    this.interrupt();
-                }
-            }, p.options.timeoutMs);
-            this.timeoutTimer.unref?.();
-        }
     }
 
     /**
@@ -215,8 +246,6 @@ export class Cdb extends EventEmitter {
     private unwatch(p: Pending): void {
         clearTimeout(this.slowTimer);
         this.slowTimer = undefined;
-        clearTimeout(this.timeoutTimer);
-        this.timeoutTimer = undefined;
         if (p.slow) {
             this.emit('slowDone', this.labelOf(p), Date.now() - p.sentAt!);
         }
@@ -299,11 +328,7 @@ export class Cdb extends EventEmitter {
             tail = '';
             this.current = undefined;
             this.unwatch(p);
-            if (p.timedOut) {
-                p.reject(new TimeoutError(`Stopped after ${Math.round(p.options.timeoutMs! / 1000)} s: the debugger was still evaluating it.`));
-            } else {
-                p.resolve(stripPrompts(p.body).replace(/\r/g, '').replace(/\s+$/, ''));
-            }
+            this.settle(p, stripPrompts(p.body).replace(/\r/g, '').replace(/\s+$/, ''));
             this.pump();
         }
     }
@@ -314,7 +339,6 @@ export class Cdb extends EventEmitter {
         }
         this.exitedFlag = true;
         clearTimeout(this.slowTimer);
-        clearTimeout(this.timeoutTimer);
         const rest = this.buffer;
         this.buffer = '';
         const failure = new Error(err ? err.message : `The debugger process exited (code ${code ?? 'unknown'}).`);
@@ -323,7 +347,7 @@ export class Cdb extends EventEmitter {
         this.queue = [];
         for (const p of all) {
             (failure as Error & { output?: string }).output = stripPrompts(p.body + rest);
-            p.reject(failure);
+            this.settle(p, failure);
         }
         if (this.seq === 0 || all.some((p) => p.id === 1)) {
             this.startupOutput += rest;

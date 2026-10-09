@@ -13,7 +13,7 @@ import {
     parseLogMessage,
     stripPrompts,
 } from '../../src/adapter/parsers';
-import { buildSourcePath, buildSymbolPath, localSymbolPath } from '../../src/adapter/symbols';
+import { buildSourcePath, buildSymbolPath, localSymbolPath, parseNetUse } from '../../src/adapter/symbols';
 
 describe('cdb output parsers', () => {
     it('strips prompts', () => {
@@ -112,6 +112,25 @@ describe('symbol paths', () => {
         assert.strictEqual(localSymbolPath(full), 'D:\\out;srv*C:\\sym;srv*E:\\x;cache*C:\\c;srv*F:\\s');
         assert.strictEqual(localSymbolPath('D:\\out'), 'D:\\out');
         assert.strictEqual(localSymbolPath('srv*https://a'), '');
+    });
+
+    it('drops mapped network drives from the symbol path used at stops', () => {
+        const netUse = [
+            'Les nouvelles connexions seront mémorisées.',
+            '',
+            'État         Local     Distant                   Réseau',
+            '-------------------------------------------------------------------------------',
+            '             H:        \\\\lgs-net.com\\alyo\\Common',
+            '                                                Microsoft Windows Network',
+            'Déconnectée  K:        \\\\server\\gone             Microsoft Windows Network',
+            'Déconnectée            \\\\sephistation\\web        Microsoft Windows Network',
+            'La commande s’est terminée correctement.',
+        ].join('\r\n');
+        const drives = parseNetUse(netUse);
+        assert.deepStrictEqual([...drives].sort(), ['H', 'K']);
+        const full = 'D:\\out;H:\\Mastering\\SymbolServer;srv*D:\\cache*https://msdl.microsoft.com/download/symbols;srv*k:\\store;srv*D:\\c2*h:\\store';
+        assert.strictEqual(localSymbolPath(full, drives), 'D:\\out;srv*D:\\cache;srv*D:\\c2');
+        assert.strictEqual(localSymbolPath(full), 'D:\\out;H:\\Mastering\\SymbolServer;srv*D:\\cache;srv*k:\\store;srv*D:\\c2*h:\\store');
     });
 
     it('builds source paths', () => {

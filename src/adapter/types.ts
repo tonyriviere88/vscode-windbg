@@ -48,7 +48,7 @@ export interface CommonArguments {
     showExternalCode?: boolean;
     initCommands?: string[];
     consoleMode?: 'commands' | 'expressions';
-    /** Seconds after which an evaluation (watch, hover, variables, logpoint) is interrupted; 0: never. */
+    /** Seconds after which a request VS Code waits for fails, and cdb's command is interrupted; 0: never. */
     evaluationTimeout?: number;
     trace?: boolean;
     hexadecimalDisplay?: boolean;

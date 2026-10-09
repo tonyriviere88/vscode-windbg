@@ -289,7 +289,7 @@
                 "type": "number",
                 "default": 10,
                 "minimum": 0,
-                "description": "Seconds after which an evaluation (watch, hover, Variables view, logpoint) is interrupted and reported as an error, so the debugger never hangs on one. 0 waits forever."
+                "description": "Seconds after which a request VS Code waits for (an evaluation, the Variables view, call stacks, threads, modules, disassembly, memory) fails with an error instead of waiting on the debugger, and the command still running is interrupted. Symbol loads you ask for have no limit. 0 waits forever."
               },
               "hexadecimalDisplay": {
                 "type": "boolean",
@@ -475,7 +475,7 @@
                 "type": "number",
                 "default": 10,
                 "minimum": 0,
-                "description": "Seconds after which an evaluation (watch, hover, Variables view, logpoint) is interrupted and reported as an error, so the debugger never hangs on one. 0 waits forever."
+                "description": "Seconds after which a request VS Code waits for (an evaluation, the Variables view, call stacks, threads, modules, disassembly, memory) fails with an error instead of waiting on the debugger, and the command still running is interrupted. Symbol loads you ask for have no limit. 0 waits forever."
               },
               "hexadecimalDisplay": {
                 "type": "boolean",
