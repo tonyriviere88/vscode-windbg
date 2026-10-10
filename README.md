@@ -7,6 +7,8 @@ It adds the parts of the Visual Studio debugger that VS Code lacks: Just My Code
 file, natvis, Parallel Stacks, a WinDbg-style command window, and per-type "break when thrown"
 exception settings.
 
+![Run and Debug view with the WinDbg Exceptions and Modules views, beside Parallel Stacks and the WinDbg command window](media/overview.png)
+
 ## Requirements
 
 - Windows x64 or ARM64.
